@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export HOME="$PROJECT_DIR/.codex_flutter_home"
+export PUB_CACHE="$PROJECT_DIR/.codex_pub_cache"
+export FLUTTER_ALREADY_LOCKED=true
+export FLUTTER_SUPPRESS_ANALYTICS=true
+
+mkdir -p "$HOME" "$PUB_CACHE"
+
+exec /opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dart \
+  /opt/homebrew/share/flutter/bin/cache/flutter_tools.snapshot "$@"
