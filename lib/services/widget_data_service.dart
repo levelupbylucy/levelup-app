@@ -55,6 +55,7 @@ class WidgetDataService {
                   .take(3)
                   .map(
                     (task) => {
+                      'id': task.id,
                       'title': task.title,
                       'completed': task.completed,
                     },
@@ -68,6 +69,30 @@ class WidgetDataService {
       // WidgetKit data sharing is only available on iOS builds.
     } on TimeoutException {
       // Flutter tests can leave platform channels unresolved.
+    }
+  }
+
+  Future<Map<String, bool>> readTaskStates() async {
+    if (_isFlutterTest || !Platform.isIOS) return const {};
+
+    try {
+      final raw = await _channel
+          .invokeMethod<String>('readWidgetTaskStates')
+          .timeout(const Duration(seconds: 2));
+      if (raw == null || raw.trim().isEmpty) return const {};
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const {};
+      return {
+        for (final item in decoded)
+          if (item is Map && item['id'] is String)
+            item['id'] as String: item['completed'] == true,
+      };
+    } on MissingPluginException {
+      return const {};
+    } on TimeoutException {
+      return const {};
+    } on FormatException {
+      return const {};
     }
   }
 

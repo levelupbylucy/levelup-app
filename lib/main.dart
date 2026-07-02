@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
@@ -6,10 +7,12 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:video_player/video_player.dart';
 
 import 'data/lucy_message_catalog.dart';
 import 'data/level_up_models.dart';
+import 'services/ai_service.dart';
 import 'services/notification_service.dart';
 import 'state/level_up_app_state.dart';
 
@@ -26,6 +29,21 @@ Future<void> main() async {
     const ReminderSettings(),
   );
   runApp(const LevelUpApp());
+}
+
+class FutureImagePickerBridge {
+  const FutureImagePickerBridge._();
+
+  static const MethodChannel _channel = MethodChannel('levelup/photo_picker');
+
+  static Future<String?> pickImage() async {
+    if (!Platform.isIOS) return null;
+    try {
+      return await _channel.invokeMethod<String>('pickFutureImage');
+    } on PlatformException {
+      return null;
+    }
+  }
 }
 
 class LevelUpApp extends StatefulWidget {
@@ -97,6 +115,7 @@ class _LevelUpLaunchState extends State<LevelUpLaunch>
   bool _changingVideo = false;
   bool _didContinue = false;
   int _videoIndex = 0;
+  int _videoLoadToken = 0;
 
   @override
   void initState() {
@@ -111,25 +130,36 @@ class _LevelUpLaunchState extends State<LevelUpLaunch>
 
   @override
   void dispose() {
-    _videoController?.removeListener(_handleVideoProgress);
-    _videoController?.dispose();
+    final controller = _videoController;
+    _videoController = null;
+    controller?.removeListener(_handleVideoProgress);
+    unawaited(
+      _disposeVideoController(controller, delay: const Duration(seconds: 2)),
+    );
     _controller.dispose();
     super.dispose();
   }
 
   Future<void> _loadVideo(int index) async {
+    final token = ++_videoLoadToken;
     final nextController = VideoPlayerController.asset(_launchVideos[index]);
     try {
       await nextController.initialize();
-      if (!mounted) {
+      if (!mounted || token != _videoLoadToken) {
         await nextController.dispose();
         return;
       }
 
-      _videoController?.removeListener(_handleVideoProgress);
-      await _videoController?.dispose();
+      final oldController = _videoController;
+      oldController?.removeListener(_handleVideoProgress);
       _videoIndex = index;
       _videoController = nextController;
+      unawaited(
+        _disposeVideoController(
+          oldController,
+          delay: const Duration(milliseconds: 700),
+        ),
+      );
       _videoController!
         ..setLooping(false)
         ..setVolume(0)
@@ -147,6 +177,24 @@ class _LevelUpLaunchState extends State<LevelUpLaunch>
         _videoReady = false;
         _changingVideo = false;
       });
+    }
+  }
+
+  Future<void> _disposeVideoController(
+    VideoPlayerController? controller, {
+    Duration delay = const Duration(milliseconds: 250),
+  }) async {
+    if (controller == null) return;
+    try {
+      await controller.pause();
+    } catch (_) {
+      return;
+    }
+    await Future<void>.delayed(delay);
+    try {
+      await controller.dispose();
+    } catch (_) {
+      // The native video player may already be gone during fast launch swaps.
     }
   }
 
@@ -215,101 +263,106 @@ class _LevelUpLaunchState extends State<LevelUpLaunch>
     final lucyText = _interval(.80, .96);
 
     return Scaffold(
-      body: Stack(
-        children: [
-          const LiquidBackground(),
-          Positioned.fill(
-            child: _videoReady && videoController != null
-                ? FittedBox(
-                    fit: BoxFit.cover,
-                    child: SizedBox(
-                      width: videoController.value.size.width,
-                      height: videoController.value.size.height,
-                      child: VideoPlayer(videoController),
-                    ),
-                  )
-                : AnimatedBuilder(
-                    animation: _controller,
-                    builder: (context, child) {
-                      return CustomPaint(
-                        painter: LaunchJourneyPainter(
-                          progress: _controller.value,
-                        ),
-                        size: Size.infinite,
-                      );
-                    },
-                  ),
-          ),
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: AppColors.background.withValues(alpha: .12),
-              ),
-            ),
-          ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(24, 26, 24, 34),
-              child: Column(
-                children: [
-                  FadeTransition(
-                    opacity: logoOpacity,
-                    child: ScaleTransition(
-                      scale: logoScale,
+      resizeToAvoidBottomInset: true,
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+        child: Stack(
+          children: [
+            const LiquidBackground(),
+            Positioned.fill(
+              child: _videoReady && videoController != null
+                  ? FittedBox(
+                      fit: BoxFit.cover,
                       child: SizedBox(
-                        width: 154,
-                        height: 46,
-                        child: Image.asset(
-                          'assets/images/levelup_logo.png',
-                          fit: BoxFit.fitWidth,
+                        width: videoController.value.size.width,
+                        height: videoController.value.size.height,
+                        child: VideoPlayer(videoController),
+                      ),
+                    )
+                  : AnimatedBuilder(
+                      animation: _controller,
+                      builder: (context, child) {
+                        return CustomPaint(
+                          painter: LaunchJourneyPainter(
+                            progress: _controller.value,
+                          ),
+                          size: Size.infinite,
+                        );
+                      },
+                    ),
+            ),
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: AppColors.background.withValues(alpha: .12),
+                ),
+              ),
+            ),
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 26, 24, 34),
+                child: Column(
+                  children: [
+                    FadeTransition(
+                      opacity: logoOpacity,
+                      child: ScaleTransition(
+                        scale: logoScale,
+                        child: SizedBox(
+                          width: 154,
+                          height: 46,
+                          child: Image.asset(
+                            'assets/images/levelup_logo.png',
+                            fit: BoxFit.fitWidth,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  const Spacer(),
-                  FadeTransition(
-                    opacity: firstText,
-                    child: const Text(
-                      'Every step matters.',
-                      textAlign: TextAlign.center,
-                      style: AppText.hero,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  FadeTransition(
-                    opacity: secondText,
-                    child: const Text(
-                      "Let's build your future.",
-                      textAlign: TextAlign.center,
-                      style: AppText.section,
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  FadeTransition(
-                    opacity: lucyText,
-                    child: GlassCard(
-                      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-                      borderRadius: 24,
-                      opacity: .56,
-                      child: Row(
-                        children: const [
-                          _IntroLucyAvatar(),
-                          SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              "Hi 👋 I'm Lucy. I'll help you turn your vision into daily action.",
-                              style: AppText.bodyStrong,
-                            ),
-                          ),
-                        ],
+                    const Spacer(),
+                    FadeTransition(
+                      opacity: firstText,
+                      child: const Text(
+                        'Every step matters.',
+                        textAlign: TextAlign.center,
+                        style: AppText.hero,
                       ),
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 12),
+                    FadeTransition(
+                      opacity: secondText,
+                      child: const Text(
+                        "Let's build your future.",
+                        textAlign: TextAlign.center,
+                        style: AppText.section,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    FadeTransition(
+                      opacity: lucyText,
+                      child: GlassCard(
+                        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+                        borderRadius: 24,
+                        opacity: .56,
+                        child: Row(
+                          children: const [
+                            _IntroLucyAvatar(),
+                            SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                "Hi 👋 I'm Lucy. I'll help you turn your vision into daily action.",
+                                style: AppText.bodyStrong,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -335,7 +388,8 @@ class _IntroLucyAvatar extends StatelessWidget {
           ),
         ],
       ),
-      child: const Icon(CupertinoIcons.sparkles, color: AppColors.sage),
+      clipBehavior: Clip.antiAlias,
+      child: Image.asset('assets/images/lucy_portrait.png', fit: BoxFit.cover),
     );
   }
 }
@@ -612,76 +666,86 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
   static String _defaultAreaVision(String area) {
     return switch (area) {
-      'Finance' => 'Build financial freedom.',
-      'Relationships' => 'Build deeper relationships.',
-      'Personal' => 'Become disciplined and calm.',
-      'Career' => 'Build my own mobile app.',
-      _ => 'Run a half marathon.',
+      'Finance' => 'Build financial freedom',
+      'Relationships' => 'Build deeper relationships',
+      'Personal' => 'Become disciplined and calm',
+      'Career' => 'Build my own mobile app',
+      _ => 'Run a half marathon',
     };
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Stack(
-        children: [
-          const LiquidBackground(),
-          SafeArea(
-            child: Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: OnboardingProgress(
-                          current: _page,
-                          total: _totalPages,
+      resizeToAvoidBottomInset: true,
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+        child: Stack(
+          children: [
+            const LiquidBackground(),
+            SafeArea(
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 12, 24, 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: OnboardingProgress(
+                            current: _page,
+                            total: _totalPages,
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Text('${_page + 1}/$_totalPages', style: AppText.caption),
-                    ],
+                        const SizedBox(width: 12),
+                        Text(
+                          '${_page + 1}/$_totalPages',
+                          style: AppText.caption,
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                Expanded(
-                  child: PageView(
-                    controller: _pageController,
-                    physics: const NeverScrollableScrollPhysics(),
-                    onPageChanged: (value) => setState(() => _page = value),
-                    children: [
-                      _WelcomeStep(onNext: _next),
-                      _NameStep(controller: _nameController),
-                      _OnboardingLoginStep(onSkip: _next),
-                      _LifeAreaVisionStep(controllers: _areaVisionControllers),
-                      const _VisionGoalTaskStep(),
-                      _ReadyStep(
-                        name: _nameController.text.trim().isEmpty
-                            ? 'there'
-                            : _nameController.text.trim(),
-                      ),
-                    ],
+                  Expanded(
+                    child: PageView(
+                      controller: _pageController,
+                      physics: const NeverScrollableScrollPhysics(),
+                      onPageChanged: (value) => setState(() => _page = value),
+                      children: [
+                        _WelcomeStep(onNext: _next),
+                        _NameStep(controller: _nameController),
+                        _OnboardingLoginStep(onSkip: _next),
+                        _LifeAreaVisionStep(
+                          controllers: _areaVisionControllers,
+                        ),
+                        const _VisionGoalTaskStep(),
+                        _ReadyStep(
+                          name: _nameController.text.trim().isEmpty
+                              ? 'there'
+                              : _nameController.text.trim(),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 8, 24, 28),
-                  child: GlassActionButton(
-                    icon: _page >= _totalPages - 1
-                        ? CupertinoIcons.check_mark_circled
-                        : CupertinoIcons.arrow_right_circle,
-                    label: _isSubmitting
-                        ? 'Preparing...'
-                        : _page >= _totalPages - 1
-                        ? 'Enter Level Up'
-                        : 'Continue',
-                    strong: true,
-                    onTap: _isSubmitting ? null : _next,
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 28),
+                    child: GlassActionButton(
+                      icon: _page >= _totalPages - 1
+                          ? CupertinoIcons.check_mark_circled
+                          : CupertinoIcons.arrow_right_circle,
+                      label: _isSubmitting
+                          ? 'Preparing...'
+                          : _page >= _totalPages - 1
+                          ? 'Create first goals'
+                          : 'Continue',
+                      strong: true,
+                      onTap: _isSubmitting ? null : _next,
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -762,16 +826,42 @@ class _WelcomeStep extends StatelessWidget {
         children: [
           const MountainPathImage(height: 260),
           const SizedBox(height: 18),
-          GlassCard(
-            borderRadius: 24,
-            padding: const EdgeInsets.all(16),
-            child: const Text(
-              "Hi 👋 I'm Lucy. I'll help you turn your vision into daily action.",
-              style: AppText.bodyStrong,
-            ),
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              const GlassCard(
+                borderRadius: 24,
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  "Hi 👋 I'm Lucy. I'll help you turn your vision into daily action.",
+                  style: AppText.bodyStrong,
+                ),
+              ),
+              const Positioned(
+                right: 14,
+                bottom: -24,
+                child: _IntroLucyAvatar(),
+              ),
+            ],
           ),
+          const SizedBox(height: 18),
         ],
       ),
+    );
+  }
+}
+
+class FutureVisionHeaderImage extends StatelessWidget {
+  const FutureVisionHeaderImage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.asset(
+      'assets/images/vision_transparent_crop.png',
+      width: 130,
+      height: 130,
+      fit: BoxFit.cover,
+      alignment: Alignment.center,
     );
   }
 }
@@ -940,20 +1030,7 @@ class _VisionGoalTaskStep extends StatelessWidget {
       title: 'Your future becomes real through steps.',
       subtitle:
           'Before we build your journey, here is the simple relationship between vision, goals and daily tasks.',
-      child: Column(
-        children: const [
-          VisionGoalTaskCard(),
-          SizedBox(height: 18),
-          GlassCard(
-            borderRadius: 24,
-            padding: EdgeInsets.all(16),
-            child: Text(
-              'Vision is who you are becoming. Goals are the big steps. Tasks are the tiny actions you complete today.',
-              style: AppText.bodyStrong,
-            ),
-          ),
-        ],
-      ),
+      child: Column(children: const [VisionGoalTaskCard()]),
     );
   }
 }
@@ -1089,9 +1166,8 @@ class _ReadyStep extends StatelessWidget {
         padding: EdgeInsets.all(22),
         child: Column(
           children: [
-            _ChecklistItem(text: 'Vision created'),
-            _ChecklistItem(text: 'Goal created'),
-            _ChecklistItem(text: 'Roadmap ready'),
+            _ChecklistItem(text: 'Vision created', done: true),
+            _ChecklistItem(text: 'Goals created'),
             _ChecklistItem(text: 'First task ready'),
           ],
         ),
@@ -1101,9 +1177,10 @@ class _ReadyStep extends StatelessWidget {
 }
 
 class _ChecklistItem extends StatelessWidget {
-  const _ChecklistItem({required this.text});
+  const _ChecklistItem({required this.text, this.done = false});
 
   final String text;
+  final bool done;
 
   @override
   Widget build(BuildContext context) {
@@ -1115,14 +1192,21 @@ class _ChecklistItem extends StatelessWidget {
             width: 26,
             height: 26,
             decoration: BoxDecoration(
-              color: AppColors.sage.withValues(alpha: .22),
+              color: done
+                  ? AppColors.sage.withValues(alpha: .22)
+                  : Colors.white.withValues(alpha: .34),
               shape: BoxShape.circle,
+              border: Border.all(
+                color: done ? AppColors.sage : AppColors.hairline,
+              ),
             ),
-            child: const Icon(
-              CupertinoIcons.check_mark,
-              size: 15,
-              color: AppColors.sage,
-            ),
+            child: done
+                ? const Icon(
+                    CupertinoIcons.check_mark,
+                    size: 15,
+                    color: AppColors.sage,
+                  )
+                : null,
           ),
           const SizedBox(width: 10),
           Expanded(child: Text(text, style: AppText.bodyStrong)),
@@ -1230,6 +1314,7 @@ class _LevelUpShellState extends State<LevelUpShell> {
   bool _showMonthOverview = false;
   String? _selectedGoalId;
   bool _lucyOpen = false;
+  bool _lucyUnread = true;
   bool _celebrating = false;
   bool _dayCompleteOpen = false;
   String? _lucyMessage;
@@ -1238,6 +1323,7 @@ class _LevelUpShellState extends State<LevelUpShell> {
     setState(() {
       _lucyMessage = message;
       _lucyOpen = true;
+      _lucyUnread = false;
     });
   }
 
@@ -1285,7 +1371,7 @@ class _LevelUpShellState extends State<LevelUpShell> {
 
   void _openGoalDetail(String goalId) {
     setState(() {
-      _tab = 1;
+      if (_tab != 2) _tab = 1;
       _selectedGoalId = goalId;
       _showGoalDetail = true;
       _showGoalCompletion = false;
@@ -1294,10 +1380,17 @@ class _LevelUpShellState extends State<LevelUpShell> {
 
   void _openGoalCompletion(String goalId) {
     setState(() {
-      _tab = 1;
       _selectedGoalId = goalId;
       _showGoalDetail = false;
       _showGoalCompletion = true;
+    });
+  }
+
+  void _closeGoalFlow() {
+    setState(() {
+      _showGoalCompletion = false;
+      _showGoalDetail = false;
+      _selectedGoalId = null;
     });
   }
 
@@ -1325,6 +1418,8 @@ class _LevelUpShellState extends State<LevelUpShell> {
         (_showMonthOverview
             ? LucyMessageCatalog.calendarPattern
             : LucyMessageCatalog.home(firstName));
+    final isSubpage =
+        _showGoalDetail || _showGoalCompletion || _showMonthOverview;
     final pages = [
       _showMonthOverview
           ? MonthOverviewScreen(onBack: _closeMonthOverview)
@@ -1334,19 +1429,15 @@ class _LevelUpShellState extends State<LevelUpShell> {
               onTaskCompleted: _celebrateTask,
               onDayCompleted: _openDayComplete,
             ),
-      _showGoalCompletion
+      _tab == 1 && _showGoalCompletion
           ? GoalCompletionScreen(
               goalId: _selectedGoalId,
+              backLabel: 'Back to Goals',
               onDone: _openGoals,
-              onAddNew: () {
-                setState(() {
-                  _showGoalCompletion = false;
-                  _showGoalDetail = false;
-                  _selectedGoalId = null;
-                });
-              },
+              onClose: _closeGoalFlow,
+              onAddNew: _openGoals,
             )
-          : _showGoalDetail
+          : _tab == 1 && _showGoalDetail
           ? GoalDetailScreen(
               goalId: _selectedGoalId,
               onBack: _openGoals,
@@ -1356,7 +1447,21 @@ class _LevelUpShellState extends State<LevelUpShell> {
               onOpenGoal: _openGoalDetail,
               resetToken: _goalsResetToken,
             ),
-      FutureMeScreen(onOpenGoal: _openGoalDetail),
+      _tab == 2 && _showGoalCompletion
+          ? GoalCompletionScreen(
+              goalId: _selectedGoalId,
+              backLabel: 'Back to Future Me',
+              onDone: _closeGoalFlow,
+              onClose: _closeGoalFlow,
+              onAddNew: _openGoals,
+            )
+          : _tab == 2 && _showGoalDetail
+          ? GoalDetailScreen(
+              goalId: _selectedGoalId,
+              onBack: _closeGoalFlow,
+              onGoalCompleted: _openGoalCompletion,
+            )
+          : FutureMeScreen(onOpenGoal: _openGoalDetail),
       const MotivateScreen(),
     ];
 
@@ -1365,11 +1470,15 @@ class _LevelUpShellState extends State<LevelUpShell> {
         children: [
           const LiquidBackground(),
           IndexedStack(index: _tab, children: pages),
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 18,
-            right: 20,
-            child: LucyAvatarButton(onTap: () => _showLucy(currentLucyMessage)),
-          ),
+          if (!isSubpage)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 18,
+              right: 20,
+              child: LucyAvatarButton(
+                hasUnread: _lucyUnread,
+                onTap: () => _showLucy(currentLucyMessage),
+              ),
+            ),
           if (_lucyOpen)
             Positioned.fill(
               child: GestureDetector(
@@ -1394,36 +1503,37 @@ class _LevelUpShellState extends State<LevelUpShell> {
               onClose: _closeDayComplete,
               onSeeGoals: _dayCompleteSeeGoals,
             ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: GlassTabBar(
-                currentIndex: _tab,
-                onTap: (index) {
-                  setState(() {
-                    if (_tab == 1 && index != 1) {
-                      _goalsResetToken++;
-                    }
-                    _tab = index;
-                    if (index != 1) {
-                      _showGoalDetail = false;
-                      _showGoalCompletion = false;
-                      _selectedGoalId = null;
-                    }
-                    if (index != 0) _showMonthOverview = false;
-                  });
-                },
+          if (!isSubpage)
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                child: GlassTabBar(
+                  currentIndex: _tab,
+                  onTap: (index) {
+                    setState(() {
+                      if (_tab == 1 && index != 1) {
+                        _goalsResetToken++;
+                      }
+                      _tab = index;
+                      if (index != 1) {
+                        _showGoalDetail = false;
+                        _showGoalCompletion = false;
+                        _selectedGoalId = null;
+                      }
+                      if (index != 0) _showMonthOverview = false;
+                    });
+                  },
+                ),
               ),
             ),
-          ),
         ],
       ),
     );
   }
 }
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.onOpenGoal,
@@ -1436,6 +1546,13 @@ class HomeScreen extends StatelessWidget {
   final VoidCallback onOpenMonth;
   final VoidCallback onTaskCompleted;
   final VoidCallback onDayCompleted;
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  DateTime _selectedDate = _dateOnly(DateTime.now());
 
   IconData _taskIcon(String category) {
     switch (category.toUpperCase()) {
@@ -1472,9 +1589,9 @@ class HomeScreen extends StatelessWidget {
           appState.todayTasks.isNotEmpty &&
           appState.todayTasks.every((item) => item.completed);
       if (allDone) {
-        onDayCompleted();
+        widget.onDayCompleted();
       } else {
-        onTaskCompleted();
+        widget.onTaskCompleted();
       }
     }
   }
@@ -1484,6 +1601,7 @@ class HomeScreen extends StatelessWidget {
       context: context,
       builder: (sheetContext) => AddDailyTaskSheet(
         goals: LevelUpScope.read(context).goals,
+        initialDate: _selectedDate,
         onCreate: (creation) async {
           final appState = LevelUpScope.read(context);
           var goalId = creation.goalId;
@@ -1491,19 +1609,46 @@ class HomeScreen extends StatelessWidget {
             await appState.addGoal(creation.newGoal!);
             goalId = creation.newGoal!.id;
           }
-          await appState.addTask(creation.task.copyWith(goalId: goalId));
+          for (final task in creation.tasks) {
+            await appState.addTask(task.copyWith(goalId: goalId));
+          }
           if (sheetContext.mounted) Navigator.of(sheetContext).pop();
         },
       ),
     );
   }
 
+  String _taskSectionTitle(DateTime selectedDate) {
+    final today = _dateOnly(DateTime.now());
+    final diff = selectedDate.difference(today).inDays;
+    if (diff == 0) return 'Today’s Tasks';
+    if (diff == -1) return 'Yesterday’s Tasks';
+    if (diff == 1) return 'Tomorrow’s Tasks';
+    return '${_weekdayName(selectedDate.weekday)}’s Tasks';
+  }
+
+  static String _weekdayName(int weekday) {
+    const names = {
+      1: 'Monday',
+      2: 'Tuesday',
+      3: 'Wednesday',
+      4: 'Thursday',
+      5: 'Friday',
+      6: 'Saturday',
+      7: 'Sunday',
+    };
+    return names[weekday] ?? 'Day';
+  }
+
+  static DateTime _dateOnly(DateTime date) =>
+      DateTime(date.year, date.month, date.day);
+
   @override
   Widget build(BuildContext context) {
     final appState = LevelUpScope.of(context);
-    final tasks = appState.todayTasks;
-    final completedCount = appState.completedTaskCount;
-    final progress = appState.dailyProgress;
+    final tasks = appState.tasksForDate(_selectedDate);
+    final completedCount = appState.completedTaskCountForDate(_selectedDate);
+    final progress = appState.dailyProgressForDate(_selectedDate);
     final percent = (progress * 100).round();
     final name = appState.user.firstName.isEmpty
         ? 'there'
@@ -1511,6 +1656,7 @@ class HomeScreen extends StatelessWidget {
     final greeting = _greetingForNow(DateTime.now());
     final weeklyPercent = (appState.weeklyProgress * 100).round();
     final streak = appState.user.streakDays;
+    final selectedAllDone = tasks.isNotEmpty && completedCount == tasks.length;
 
     return AppScrollView(
       child: Stack(
@@ -1543,7 +1689,9 @@ class HomeScreen extends StatelessWidget {
                           progress: progress,
                           label: '$percent%',
                           size: 106,
-                          color: AppColors.clay,
+                          color: selectedAllDone
+                              ? AppColors.sage
+                              : AppColors.clay,
                         ),
                         const SizedBox(width: 24),
                         Expanded(
@@ -1556,28 +1704,17 @@ class HomeScreen extends StatelessWidget {
                               ),
                               const Text('tasks done', style: AppText.taskDone),
                               const SizedBox(height: 8),
-                              Text.rich(
-                                TextSpan(
-                                  text: tasks.isEmpty
-                                      ? 'Create a goal to unlock daily tasks'
-                                      : completedCount == tasks.length
-                                      ? 'All tasks done · Great work'
-                                      : 'You’re ',
-                                  children:
-                                      tasks.isEmpty ||
-                                          completedCount == tasks.length
-                                      ? const []
-                                      : const [
-                                          TextSpan(
-                                            text: 'on fire',
-                                            style: TextStyle(
-                                              color: AppColors.clay,
-                                            ),
-                                          ),
-                                          TextSpan(text: ' · Keep going'),
-                                        ],
+                              Text(
+                                tasks.isEmpty
+                                    ? 'Create a goal to unlock daily tasks'
+                                    : completedCount == 0
+                                    ? 'You can do this!'
+                                    : 'You’re on fire 🔥 · Keep going',
+                                style: AppText.caption.copyWith(
+                                  color: completedCount > 0
+                                      ? AppColors.clay
+                                      : null,
                                 ),
-                                style: AppText.caption,
                               ),
                             ],
                           ),
@@ -1608,13 +1745,18 @@ class HomeScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 14),
-              WeekStrip(onTap: onOpenMonth),
+              WeekStrip(
+                selectedDate: _selectedDate,
+                onOpenMonth: widget.onOpenMonth,
+                onSelectDate: (date) =>
+                    setState(() => _selectedDate = _dateOnly(date)),
+              ),
               const SizedBox(height: 16),
               Row(
                 children: [
                   Expanded(
                     child: SectionHeader(
-                      title: 'Today’s Tasks',
+                      title: _taskSectionTitle(_selectedDate),
                       trailing: '$completedCount of ${tasks.length} done',
                     ),
                   ),
@@ -1645,7 +1787,7 @@ class HomeScreen extends StatelessWidget {
                     onTap: () => _toggleTask(context, task),
                     onOpen: task.goalId == null
                         ? null
-                        : () => onOpenGoal(task.goalId!),
+                        : () => widget.onOpenGoal(task.goalId!),
                   ),
                   const SizedBox(height: 12),
                 ],
@@ -1661,10 +1803,12 @@ class AddDailyTaskSheet extends StatefulWidget {
   const AddDailyTaskSheet({
     super.key,
     required this.goals,
+    required this.initialDate,
     required this.onCreate,
   });
 
   final List<Goal> goals;
+  final DateTime initialDate;
   final ValueChanged<DailyTaskCreation> onCreate;
 
   @override
@@ -1672,11 +1816,15 @@ class AddDailyTaskSheet extends StatefulWidget {
 }
 
 class _AddDailyTaskSheetState extends State<AddDailyTaskSheet> {
-  final _title = TextEditingController(text: 'New daily task');
-  final _subtitle = TextEditingController(text: 'One clear action for today');
-  final _newGoalTitle = TextEditingController(text: 'New goal');
+  final _title = TextEditingController();
+  final _subtitle = TextEditingController();
+  final _newGoalTitle = TextEditingController();
+  final _repeatTotal = TextEditingController(text: '1');
   String _selectedGoalId = 'new_goal';
   String _category = 'PERSONAL';
+  late DateTime _plannedFor = widget.initialDate;
+  bool _repeatsDaily = false;
+  List<int> _repeatWeekdays = [];
 
   @override
   void initState() {
@@ -1692,6 +1840,7 @@ class _AddDailyTaskSheetState extends State<AddDailyTaskSheet> {
     _title.dispose();
     _subtitle.dispose();
     _newGoalTitle.dispose();
+    _repeatTotal.dispose();
     super.dispose();
   }
 
@@ -1733,6 +1882,62 @@ class _AddDailyTaskSheetState extends State<AddDailyTaskSheet> {
             GoalFormField(label: 'Task title', controller: _title),
             const SizedBox(height: 12),
             GoalFormField(label: 'Task note', controller: _subtitle),
+            const SizedBox(height: 14),
+            const Text('Task date', style: AppText.eyebrow),
+            const SizedBox(height: 8),
+            GestureDetector(
+              onTap: _pickTaskDate,
+              child: _DateSelectorTile(
+                icon: CupertinoIcons.calendar,
+                label: _AddGoalSheetState._friendlyDate(_plannedFor),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                const Expanded(child: Text('Repeat', style: AppText.eyebrow)),
+                SizedBox(
+                  width: 96,
+                  child: CupertinoTextField(
+                    controller: _repeatTotal,
+                    keyboardType: TextInputType.number,
+                    placeholder: 'Times',
+                    textAlign: TextAlign.center,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: .46),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: .66),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: GlassActionButton(
+                    icon: CupertinoIcons.repeat,
+                    label: _repeatLabel,
+                    onTap: _pickRepeatDays,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: GlassActionButton(
+                    icon: CupertinoIcons.calendar,
+                    label: 'One-time',
+                    onTap: () => setState(() {
+                      _repeatsDaily = false;
+                      _repeatWeekdays = [];
+                      _repeatTotal.text = '1';
+                    }),
+                  ),
+                ),
+              ],
+            ),
             const SizedBox(height: 14),
             const Text('Assign to goal', style: AppText.eyebrow),
             const SizedBox(height: 8),
@@ -1781,6 +1986,21 @@ class _AddDailyTaskSheetState extends State<AddDailyTaskSheet> {
                 final taskTitle = _title.text.trim().isEmpty
                     ? 'New daily task'
                     : _title.text.trim();
+                final repeatTotal =
+                    int.tryParse(_repeatTotal.text.trim())?.clamp(1, 365) ?? 1;
+                final repeatDays =
+                    _repeatsDaily
+                          ? const [1, 2, 3, 4, 5, 6, 7]
+                          : [..._repeatWeekdays]
+                      ..sort();
+                final scheduledDates = _scheduledTaskDates(
+                  start: _plannedFor,
+                  repeatTotal: repeatTotal,
+                  repeatDays: repeatDays,
+                );
+                final repeatGroupId = scheduledDates.length > 1
+                    ? 'repeat_${now.millisecondsSinceEpoch}'
+                    : null;
                 Goal? newGoal;
                 if (_selectedGoalId == 'new_goal') {
                   final goalId = 'goal_${now.millisecondsSinceEpoch}';
@@ -1796,22 +2016,41 @@ class _AddDailyTaskSheetState extends State<AddDailyTaskSheet> {
                     timeline: taskTitle,
                     completed: false,
                     milestones: [
-                      Milestone(id: '${goalId}_milestone_0', title: taskTitle),
+                      Milestone(
+                        id: '${goalId}_milestone_0',
+                        title: taskTitle,
+                        dueDate: _repeatsDaily || _repeatWeekdays.isNotEmpty
+                            ? null
+                            : _plannedFor,
+                        repeatsDaily: _repeatsDaily,
+                        repeatWeekdays: _repeatWeekdays,
+                      ),
                     ],
                   );
                 }
                 widget.onCreate(
                   DailyTaskCreation(
-                    task: DailyTask(
-                      id: 'task_${now.millisecondsSinceEpoch}',
-                      title: taskTitle,
-                      subtitle: _subtitle.text.trim().isEmpty
-                          ? 'Today’s action'
-                          : _subtitle.text.trim(),
-                      category: selectedGoal?.category ?? _category,
-                      completed: false,
-                      plannedFor: now,
-                    ),
+                    tasks: [
+                      for (var i = 0; i < scheduledDates.length; i++)
+                        DailyTask(
+                          id: 'task_${now.millisecondsSinceEpoch}_$i',
+                          title: taskTitle,
+                          subtitle: _subtitle.text.trim().isEmpty
+                              ? _taskScheduleSubtitle(
+                                  scheduledDates.length,
+                                  i + 1,
+                                )
+                              : _subtitle.text.trim(),
+                          category: selectedGoal?.category ?? _category,
+                          completed: false,
+                          plannedFor: scheduledDates[i],
+                          dueDate: scheduledDates[i],
+                          repeatGroupId: repeatGroupId,
+                          repeatIndex: i + 1,
+                          repeatTotal: scheduledDates.length,
+                          repeatWeekdays: repeatDays,
+                        ),
+                    ],
                     goalId: _selectedGoalId == 'new_goal'
                         ? null
                         : _selectedGoalId,
@@ -1825,12 +2064,197 @@ class _AddDailyTaskSheetState extends State<AddDailyTaskSheet> {
       ),
     );
   }
+
+  String get _repeatLabel {
+    if (_repeatsDaily) return 'Every day';
+    if (_repeatWeekdays.isNotEmpty) {
+      return _MilestoneDraft._weekdayLabel(_repeatWeekdays);
+    }
+    return 'Choose days';
+  }
+
+  Future<void> _pickTaskDate() async {
+    final selected = await _showDatePicker(_plannedFor);
+    if (selected != null) setState(() => _plannedFor = selected);
+  }
+
+  Future<DateTime?> _showDatePicker(DateTime initialDate) {
+    var selected = initialDate;
+    return showCupertinoModalPopup<DateTime>(
+      context: context,
+      builder: (context) => Container(
+        height: 330,
+        padding: const EdgeInsets.only(top: 8),
+        color: AppColors.cream,
+        child: Column(
+          children: [
+            Row(
+              children: [
+                CupertinoButton(
+                  child: const Text('Cancel'),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+                const Spacer(),
+                CupertinoButton(
+                  child: const Text('Done'),
+                  onPressed: () => Navigator.of(context).pop(selected),
+                ),
+              ],
+            ),
+            Expanded(
+              child: CupertinoDatePicker(
+                mode: CupertinoDatePickerMode.date,
+                initialDateTime: initialDate,
+                minimumYear: 2024,
+                maximumYear: 2035,
+                onDateTimeChanged: (date) => selected = date,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickRepeatDays() {
+    final selected = _repeatsDaily
+        ? {1, 2, 3, 4, 5, 6, 7}
+        : _repeatWeekdays.toSet();
+    return showCupertinoModalPopup<void>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setPickerState) {
+          void toggleDay(int day) {
+            setPickerState(() {
+              if (selected.contains(day)) {
+                selected.remove(day);
+              } else {
+                selected.add(day);
+              }
+            });
+          }
+
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 28),
+            child: GlassCard(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 20),
+              borderRadius: 28,
+              opacity: .94,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text('Repeat days', style: AppText.section),
+                      ),
+                      CupertinoButton(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(32, 32),
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Icon(CupertinoIcons.xmark_circle_fill),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final day in const [
+                        (1, 'Mon'),
+                        (2, 'Tue'),
+                        (3, 'Wed'),
+                        (4, 'Thu'),
+                        (5, 'Fri'),
+                        (6, 'Sat'),
+                        (7, 'Sun'),
+                      ])
+                        GestureDetector(
+                          onTap: () => toggleDay(day.$1),
+                          child: CategoryPill(
+                            label: day.$2,
+                            active: selected.contains(day.$1),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: GlassActionButton(
+                          icon: CupertinoIcons.calendar,
+                          label: 'One-time',
+                          onTap: () {
+                            setState(() {
+                              _repeatsDaily = false;
+                              _repeatWeekdays = [];
+                              _repeatTotal.text = '1';
+                            });
+                            Navigator.of(context).pop();
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: GlassActionButton(
+                          icon: CupertinoIcons.check_mark_circled,
+                          label: 'Save',
+                          strong: true,
+                          onTap: () {
+                            setState(() {
+                              final days = selected.toList()..sort();
+                              _repeatsDaily = days.length == 7;
+                              _repeatWeekdays = _repeatsDaily ? [] : days;
+                              if (days.isNotEmpty &&
+                                  (int.tryParse(_repeatTotal.text) ?? 1) <= 1) {
+                                _repeatTotal.text = '10';
+                              }
+                            });
+                            Navigator.of(context).pop();
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  List<DateTime> _scheduledTaskDates({
+    required DateTime start,
+    required int repeatTotal,
+    required List<int> repeatDays,
+  }) {
+    final startDate = DateTime(start.year, start.month, start.day);
+    if (repeatDays.isEmpty || repeatTotal <= 1) return [startDate];
+
+    final dates = <DateTime>[];
+    var cursor = startDate;
+    while (dates.length < repeatTotal) {
+      if (repeatDays.contains(cursor.weekday)) dates.add(cursor);
+      cursor = cursor.add(const Duration(days: 1));
+    }
+    return dates;
+  }
+
+  String _taskScheduleSubtitle(int total, int index) {
+    if (total <= 1) return 'Today’s action';
+    return 'Repeated task $index of $total';
+  }
 }
 
 class DailyTaskCreation {
-  const DailyTaskCreation({required this.task, this.goalId, this.newGoal});
+  const DailyTaskCreation({required this.tasks, this.goalId, this.newGoal});
 
-  final DailyTask task;
+  final List<DailyTask> tasks;
   final String? goalId;
   final Goal? newGoal;
 }
@@ -2131,8 +2555,10 @@ class _CompletedGoalsContentState extends State<CompletedGoalsContent> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _CompletedGoalsHero(completedCount: widget.completedGoals.length),
-        const SizedBox(height: 18),
+        if (widget.completedGoals.isNotEmpty) ...[
+          _CompletedGoalsHero(completedCount: widget.completedGoals.length),
+          const SizedBox(height: 18),
+        ],
         _GoalAreaFilters(
           selectedFilter: _selectedFilter,
           onSelected: (filter) => setState(() => _selectedFilter = filter),
@@ -2178,7 +2604,7 @@ class _CompletedGoalsContentState extends State<CompletedGoalsContent> {
       case 'FAMILY':
         return CupertinoIcons.person_2;
       case 'HEALTH':
-        return CupertinoIcons.heart;
+        return Icons.fitness_center;
       default:
         return CupertinoIcons.sparkles;
     }
@@ -2267,7 +2693,7 @@ class _CompletedGoalsHero extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Amazing work!\nYou’ve completed $completedCount goals',
+                      'Amazing work!\nYou’ve completed $completedCount ${completedCount == 1 ? 'goal' : 'goals'}',
                       style: AppText.section.copyWith(
                         fontSize: 22,
                         height: 1.16,
@@ -2445,7 +2871,7 @@ class GoalsOverviewCard extends StatelessWidget {
             runSpacing: 16,
             children: const [
               GoalCategoryMetric(
-                icon: CupertinoIcons.heart,
+                icon: Icons.fitness_center,
                 value: '62%',
                 label: 'Health',
                 color: AppColors.sage,
@@ -2463,7 +2889,7 @@ class GoalsOverviewCard extends StatelessWidget {
                 color: AppColors.sage,
               ),
               GoalCategoryMetric(
-                icon: CupertinoIcons.sparkles,
+                icon: CupertinoIcons.heart,
                 value: '44%',
                 label: 'Personal',
                 color: AppColors.sage,
@@ -2716,14 +3142,17 @@ class GoalsHeaderImage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(22),
-      child: Image.asset(
-        'assets/images/goal_staircase_transparent_crop.png',
-        width: 112,
-        height: 112,
-        fit: BoxFit.cover,
-        alignment: Alignment.center,
+    return Transform.translate(
+      offset: const Offset(-10, 0),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(22),
+        child: Image.asset(
+          'assets/images/goal_staircase_transparent_crop.png',
+          width: 124,
+          height: 124,
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+        ),
       ),
     );
   }
@@ -2739,7 +3168,7 @@ class MountainPathImage extends StatelessWidget {
     return ClipRRect(
       borderRadius: BorderRadius.circular(24),
       child: Image.asset(
-        'assets/images/goal_staircase_mountain.png',
+        'assets/images/goal_staircase_transparent_crop.png',
         height: height,
         width: double.infinity,
         fit: BoxFit.cover,
@@ -2916,6 +3345,7 @@ class _AddGoalSheetState extends State<AddGoalSheet> {
   );
   String _area = 'HEALTH';
   String _vision = '';
+  bool _aiPlanning = false;
 
   @override
   void initState() {
@@ -2999,6 +3429,20 @@ class _AddGoalSheetState extends State<AddGoalSheet> {
                     const Expanded(
                       child: Text('Task plan', style: AppText.eyebrow),
                     ),
+                    CupertinoButton(
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(0, 28),
+                      onPressed: _aiPlanning ? null : _generateAiPlan,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(CupertinoIcons.sparkles, size: 16),
+                          const SizedBox(width: 5),
+                          Text(_aiPlanning ? 'Drafting' : 'AI plan'),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
                     CupertinoButton(
                       padding: EdgeInsets.zero,
                       minimumSize: const Size(0, 28),
@@ -3112,6 +3556,210 @@ class _AddGoalSheetState extends State<AddGoalSheet> {
     final removed = _milestones.removeAt(index);
     removed.dispose();
     setState(() {});
+  }
+
+  Future<void> _generateAiPlan() async {
+    final options = await _showAiPlanOptions();
+    if (options == null) return;
+
+    setState(() => _aiPlanning = true);
+    final result = await AiService.instance.generateTaskPlan(
+      AiTaskPlanRequest(
+        goalTitle: _title.text.trim().isEmpty ? 'My goal' : _title.text.trim(),
+        category: _area,
+        deadline: _deadline,
+        daysPerWeek: options.daysPerWeek,
+        minutesPerSession: options.minutesPerSession,
+        preferredWeekdays: options.weekdays,
+      ),
+    );
+    if (!mounted) return;
+
+    setState(() {
+      for (final milestone in _milestones) {
+        milestone.dispose();
+      }
+      _milestones
+        ..clear()
+        ..addAll(
+          result.tasks.map(
+            (task) => _MilestoneDraft(
+              title: task.title,
+              dueDate: task.dueDate,
+              repeatsDaily: task.repeatsDaily,
+              repeatWeekdays: task.repeatWeekdays,
+            ),
+          ),
+        );
+      _aiPlanning = false;
+    });
+
+    await _showInfoDialog('AI task plan', result.note);
+  }
+
+  Future<({int daysPerWeek, int minutesPerSession, List<int> weekdays})?>
+  _showAiPlanOptions() {
+    var daysPerWeek = 3;
+    var minutesPerSession = 30;
+    final weekdays = <int>{1, 3, 5};
+    return showCupertinoModalPopup<
+      ({int daysPerWeek, int minutesPerSession, List<int> weekdays})
+    >(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void toggleWeekday(int day) {
+            setSheetState(() {
+              if (weekdays.contains(day)) {
+                weekdays.remove(day);
+              } else {
+                weekdays.add(day);
+              }
+              daysPerWeek = weekdays.length.clamp(1, 7);
+            });
+          }
+
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 28),
+            child: GlassCard(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 20),
+              borderRadius: 28,
+              opacity: .94,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                        child: Text('AI task plan', style: AppText.section),
+                      ),
+                      CupertinoButton(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(32, 32),
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Icon(CupertinoIcons.xmark_circle_fill),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Lucy will draft tasks. You can edit everything before saving.',
+                    style: AppText.caption,
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('Days per week', style: AppText.eyebrow),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final value in const [1, 2, 3, 4, 5, 6, 7])
+                        GestureDetector(
+                          onTap: () => setSheetState(() {
+                            daysPerWeek = value;
+                            weekdays
+                              ..clear()
+                              ..addAll(_defaultWeekdays(value));
+                          }),
+                          child: CategoryPill(
+                            label: '$value',
+                            active: daysPerWeek == value,
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text('Preferred days', style: AppText.eyebrow),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final day in const [
+                        (1, 'Mon'),
+                        (2, 'Tue'),
+                        (3, 'Wed'),
+                        (4, 'Thu'),
+                        (5, 'Fri'),
+                        (6, 'Sat'),
+                        (7, 'Sun'),
+                      ])
+                        GestureDetector(
+                          onTap: () => toggleWeekday(day.$1),
+                          child: CategoryPill(
+                            label: day.$2,
+                            active: weekdays.contains(day.$1),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text('Time per session', style: AppText.eyebrow),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final value in const [15, 30, 45, 60])
+                        GestureDetector(
+                          onTap: () =>
+                              setSheetState(() => minutesPerSession = value),
+                          child: CategoryPill(
+                            label: '$value min',
+                            active: minutesPerSession == value,
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  GlassActionButton(
+                    icon: CupertinoIcons.sparkles,
+                    label: 'Generate draft',
+                    strong: true,
+                    onTap: () {
+                      final selectedWeekdays = weekdays.toList()..sort();
+                      Navigator.of(context).pop((
+                        daysPerWeek: daysPerWeek,
+                        minutesPerSession: minutesPerSession,
+                        weekdays: selectedWeekdays,
+                      ));
+                    },
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  List<int> _defaultWeekdays(int daysPerWeek) {
+    const patterns = {
+      1: [1],
+      2: [1, 4],
+      3: [1, 3, 5],
+      4: [1, 2, 4, 6],
+      5: [1, 2, 3, 4, 5],
+      6: [1, 2, 3, 4, 5, 6],
+      7: [1, 2, 3, 4, 5, 6, 7],
+    };
+    return patterns[daysPerWeek] ?? const [1, 3, 5];
+  }
+
+  Future<void> _showInfoDialog(String title, String message) {
+    return showCupertinoDialog<void>(
+      context: context,
+      builder: (dialogContext) => CupertinoAlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _editMilestoneTitle(int index) async {
@@ -4025,12 +4673,16 @@ class GoalCompletionScreen extends StatelessWidget {
   const GoalCompletionScreen({
     super.key,
     required this.goalId,
+    required this.backLabel,
     required this.onDone,
+    required this.onClose,
     required this.onAddNew,
   });
 
   final String? goalId;
+  final String backLabel;
   final VoidCallback onDone;
+  final VoidCallback onClose;
   final VoidCallback onAddNew;
 
   @override
@@ -4053,6 +4705,13 @@ class GoalCompletionScreen extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Row(
+                  children: [
+                    const Spacer(),
+                    GlassIconButton(icon: CupertinoIcons.xmark, onTap: onClose),
+                  ],
+                ),
+                const SizedBox(height: 4),
                 Center(
                   child: Image.asset(
                     'assets/images/goal_completed.png',
@@ -4097,7 +4756,7 @@ class GoalCompletionScreen extends StatelessWidget {
           const SizedBox(height: 18),
           GlassActionButton(
             icon: CupertinoIcons.check_mark_circled,
-            label: 'Back to Goals',
+            label: backLabel,
             strong: true,
             onTap: onDone,
           ),
@@ -4218,15 +4877,26 @@ class FutureMeScreen extends StatefulWidget {
 }
 
 class _FutureMeScreenState extends State<FutureMeScreen> {
-  final Set<String> _selectedAreas = {'Health'};
+  final Set<String> _selectedAreas = {'All'};
+  bool _aiImageGenerating = false;
+  static const double _futureMeContentOverlap = -42;
 
   void _toggleArea(String area) {
     setState(() {
+      if (area == 'All') {
+        _selectedAreas
+          ..clear()
+          ..add('All');
+        return;
+      }
+
+      _selectedAreas.remove('All');
       if (_selectedAreas.contains(area)) {
-        if (_selectedAreas.length > 1) _selectedAreas.remove(area);
+        _selectedAreas.remove(area);
       } else {
         _selectedAreas.add(area);
       }
+      if (_selectedAreas.isEmpty) _selectedAreas.add('All');
     });
   }
 
@@ -4239,6 +4909,7 @@ class _FutureMeScreenState extends State<FutureMeScreen> {
         ? 'I am healthy, confident and becoming the person I want to be.'
         : user.vision.trim();
     final goals = appState.activeGoals;
+    final profilePhotoUrl = appState.authSession.photoUrl.trim();
 
     return AppScrollView(
       child: Column(
@@ -4246,70 +4917,103 @@ class _FutureMeScreenState extends State<FutureMeScreen> {
         children: [
           const AppHeader(),
           const SizedBox(height: 30),
-          const Text('Future Me', style: AppText.title),
-          const SizedBox(height: 6),
-          Text(
-            'Design the life you want.',
-            style: AppText.body.copyWith(color: AppColors.muted),
-          ),
-          const SizedBox(height: 24),
-          GlassCard(
-            padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
-            borderRadius: 28,
-            opacity: .62,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SoftIconBubble(
-                      icon: CupertinoIcons.person,
-                      color: AppColors.ink,
-                      size: 64,
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            name,
-                            style: AppText.section.copyWith(fontSize: 24),
-                          ),
-                          const SizedBox(height: 3),
-                          const Text(
-                            'Future identity snapshot',
-                            style: AppText.caption,
-                          ),
-                        ],
-                      ),
-                    ),
-                    GlassIconButton(
-                      icon: CupertinoIcons.pencil,
-                      onTap: () => _showEditVision(context, vision),
+                    const Text('Future Me', style: AppText.title),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Design the life you want.',
+                      style: AppText.body.copyWith(color: AppColors.muted),
                     ),
                   ],
                 ),
-                const SizedBox(height: 16),
-                FutureMeImagePicker(
-                  imagePath: user.futureImagePath,
-                  onTap: () => _showFutureImageDialog(context),
-                ),
-                const SizedBox(height: 22),
-                const Text('MY VISION', style: AppText.eyebrow),
-                const SizedBox(height: 10),
-                Text(
-                  vision,
-                  style: AppText.section.copyWith(
-                    fontSize: 18,
-                    height: 1.4,
-                    fontWeight: FontWeight.w300,
+              ),
+              Transform.translate(
+                offset: const Offset(-10, -25), // x, y
+                child: const FutureVisionHeaderImage(),
+              ),
+            ],
+          ),
+          Transform.translate(
+            offset: const Offset(0, _futureMeContentOverlap),
+            child: GlassCard(
+              padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
+              borderRadius: 28,
+              opacity: .42,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      FutureMeProfileAvatar(photoUrl: profilePhotoUrl),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              name,
+                              style: AppText.section.copyWith(fontSize: 24),
+                            ),
+                            const SizedBox(height: 3),
+                            const Text(
+                              'Future identity snapshot',
+                              style: AppText.caption,
+                            ),
+                          ],
+                        ),
+                      ),
+                      GlassIconButton(
+                        icon: CupertinoIcons.pencil,
+                        onTap: () => _showEditVision(context, vision),
+                      ),
+                    ],
                   ),
-                ),
-              ],
+                  const SizedBox(height: 16),
+                  FutureMeImagePicker(
+                    imagePath: user.futureImagePath,
+                    onTap: () => _showFutureImageDialog(context),
+                    onRemove: user.futureImagePath.trim().isEmpty
+                        ? null
+                        : () => _removeFutureImage(context),
+                  ),
+                  const SizedBox(height: 10),
+                  Center(
+                    child: SizedBox(
+                      width: 210,
+                      child: GlassActionButton(
+                        icon: CupertinoIcons.sparkles,
+                        label: _aiImageGenerating
+                            ? 'Generating'
+                            : 'Generate with AI',
+                        strong: false,
+                        onTap: _aiImageGenerating
+                            ? null
+                            : () => _generateFutureMeImage(context),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  const Text('MY VISION', style: AppText.eyebrow),
+                  const SizedBox(height: 10),
+                  Text(
+                    vision,
+                    style: AppText.section.copyWith(
+                      fontSize: 18,
+                      height: 1.4,
+                      fontWeight: FontWeight.w300,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 0),
           GlassCard(
             padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
             borderRadius: 28,
@@ -4379,38 +5083,61 @@ class _FutureMeScreenState extends State<FutureMeScreen> {
 
   Future<void> _showFutureImageDialog(BuildContext context) async {
     final appState = LevelUpScope.read(context);
-    final controller = TextEditingController(
-      text: appState.user.futureImagePath,
+    final pickedPath = await FutureImagePickerBridge.pickImage();
+    if (pickedPath == null || pickedPath.trim().isEmpty) return;
+    await appState.updateUser(futureImagePath: pickedPath.trim());
+  }
+
+  Future<void> _generateFutureMeImage(BuildContext context) async {
+    final appState = LevelUpScope.read(context);
+    final sourcePath = appState.user.futureImagePath.trim();
+    if (sourcePath.isEmpty || sourcePath.startsWith('http')) {
+      await _showFutureImageMessage(
+        'Add your photo first',
+        'Upload a current photo first, then Lucy can generate your Future Me image from your vision.',
+      );
+      return;
+    }
+
+    setState(() => _aiImageGenerating = true);
+    final result = await AiService.instance.generateFutureImage(
+      AiFutureImageRequest(
+        sourceImagePath: sourcePath,
+        vision: appState.user.vision,
+        areaVisions: appState.user.areaVisions,
+      ),
     );
-    await showCupertinoDialog<void>(
+    if (!mounted) return;
+    setState(() => _aiImageGenerating = false);
+
+    if (result == null) {
+      await _showFutureImageMessage(
+        'AI image is not connected yet',
+        'The app is ready for a secure backend endpoint. Add LEVELUP_AI_BASE_URL when the image generation backend is deployed.',
+      );
+      return;
+    }
+    await appState.updateUser(futureImagePath: result.imageUrl);
+  }
+
+  Future<void> _showFutureImageMessage(String title, String message) {
+    return showCupertinoDialog<void>(
       context: context,
       builder: (dialogContext) => CupertinoAlertDialog(
-        title: const Text('Add Future Me image'),
-        content: Padding(
-          padding: const EdgeInsets.only(top: 10),
-          child: CupertinoTextField(
-            controller: controller,
-            placeholder: 'Paste image file path',
-          ),
-        ),
+        title: Text(title),
+        content: Text(message),
         actions: [
           CupertinoDialogAction(
             onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('Cancel'),
-          ),
-          CupertinoDialogAction(
-            onPressed: () async {
-              await appState.updateUser(
-                futureImagePath: controller.text.trim(),
-              );
-              if (dialogContext.mounted) Navigator.of(dialogContext).pop();
-            },
-            child: const Text('Save'),
+            child: const Text('OK'),
           ),
         ],
       ),
     );
-    controller.dispose();
+  }
+
+  Future<void> _removeFutureImage(BuildContext context) async {
+    await LevelUpScope.read(context).updateUser(futureImagePath: '');
   }
 
   Future<void> _openLifeAreaGoal(BuildContext context, Goal goal) async {
@@ -4423,51 +5150,128 @@ class _FutureMeScreenState extends State<FutureMeScreen> {
   }
 }
 
+class FutureMeProfileAvatar extends StatelessWidget {
+  const FutureMeProfileAvatar({super.key, required this.photoUrl});
+
+  final String photoUrl;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasPhoto = photoUrl.isNotEmpty;
+    return Container(
+      width: 64,
+      height: 64,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.white.withValues(alpha: .42),
+        border: Border.all(color: Colors.white.withValues(alpha: .70)),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.sage.withValues(alpha: .12),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: hasPhoto
+          ? SizedBox.expand(
+              child: Image.network(
+                photoUrl,
+                fit: BoxFit.cover,
+                alignment: Alignment.center,
+                errorBuilder: (_, _, _) => const Icon(
+                  CupertinoIcons.person,
+                  color: AppColors.ink,
+                  size: 28,
+                ),
+              ),
+            )
+          : const Icon(CupertinoIcons.person, color: AppColors.ink, size: 28),
+    );
+  }
+}
+
 class FutureMeImagePicker extends StatelessWidget {
   const FutureMeImagePicker({
     super.key,
     required this.imagePath,
     required this.onTap,
+    this.onRemove,
   });
 
   final String imagePath;
   final VoidCallback onTap;
+  final VoidCallback? onRemove;
 
   @override
   Widget build(BuildContext context) {
-    final file = imagePath.trim().isEmpty ? null : File(imagePath.trim());
-    final hasImage = file != null && file.existsSync();
-    return GestureDetector(
-      onTap: onTap,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(22),
-        child: Container(
-          height: 156,
-          width: double.infinity,
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: .44),
-            borderRadius: BorderRadius.circular(22),
-            border: Border.all(color: Colors.white.withValues(alpha: .70)),
-          ),
-          child: hasImage
-              ? Image.file(file, fit: BoxFit.cover)
-              : Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    SoftIconBubble(
-                      icon: CupertinoIcons.photo,
-                      color: AppColors.sage,
-                      size: 48,
+    final trimmedPath = imagePath.trim();
+    final isRemoteImage = trimmedPath.startsWith('http');
+    final file = trimmedPath.isEmpty || isRemoteImage
+        ? null
+        : File(trimmedPath);
+    final hasImage = isRemoteImage || (file != null && file.existsSync());
+    return Center(
+      child: SizedBox(
+        width: 156,
+        height: 156,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                onTap: onTap,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(22),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: .44),
+                      borderRadius: BorderRadius.circular(22),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: .70),
+                      ),
                     ),
-                    const SizedBox(height: 10),
-                    Text(
-                      'Add your Future Me image',
-                      style: AppText.bodyStrong.copyWith(color: AppColors.ink),
-                    ),
-                    const SizedBox(height: 4),
-                    const Text('Tap to add image path', style: AppText.caption),
-                  ],
+                    child: hasImage
+                        ? isRemoteImage
+                              ? Image.network(trimmedPath, fit: BoxFit.cover)
+                              : Image.file(file!, fit: BoxFit.cover)
+                        : Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              SoftIconBubble(
+                                icon: CupertinoIcons.photo,
+                                color: AppColors.sage,
+                                size: 46,
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                'Add image',
+                                style: AppText.bodyStrong.copyWith(
+                                  color: AppColors.ink,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              const Text(
+                                'Tap to choose',
+                                style: AppText.caption,
+                              ),
+                            ],
+                          ),
+                  ),
                 ),
+              ),
+            ),
+            if (hasImage && onRemove != null)
+              Positioned(
+                top: -10,
+                right: -10,
+                child: GlassIconButton(
+                  icon: CupertinoIcons.trash,
+                  onTap: onRemove,
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -4481,13 +5285,7 @@ class LifeAreaLabelFilters extends StatelessWidget {
     required this.onAreaTap,
   });
 
-  static const areas = [
-    'Health',
-    'Finance',
-    'Relationships',
-    'Personal',
-    'Career',
-  ];
+  static const areas = ['All', 'Health', 'Finance', 'Personal', 'Career'];
 
   final Set<String> selectedAreas;
   final ValueChanged<String> onAreaTap;
@@ -4742,16 +5540,14 @@ class LifeAreaGoalList extends StatelessWidget {
         : area == 'Career'
         ? CupertinoIcons.briefcase
         : area == 'Personal'
-        ? CupertinoIcons.person
-        : area == 'Relationships'
-        ? CupertinoIcons.person_2
-        : CupertinoIcons.heart;
+        ? CupertinoIcons.heart
+        : Icons.fitness_center;
   }
 
   @override
   Widget build(BuildContext context) {
-    final areas = selectedAreas.isEmpty
-        ? const ['Health']
+    final areas = selectedAreas.contains('All') || selectedAreas.isEmpty
+        ? const ['Health', 'Finance', 'Personal', 'Career']
         : selectedAreas.toList();
     return Column(
       children: [
@@ -4840,14 +5636,6 @@ class LifeAreaGoalList extends StatelessWidget {
                           ),
                         ),
                       ),
-                    const Divider(color: AppColors.hairline),
-                    Text(
-                      'Tasks: ${plan.taskRule}',
-                      style: AppText.caption.copyWith(
-                        color: AppColors.muted,
-                        height: 1.3,
-                      ),
-                    ),
                   ],
                 );
               },
@@ -4874,7 +5662,6 @@ class _LifeAreaPlan {
   static String defaultVisionFor(String area) {
     return switch (area) {
       'Finance' => 'Build calm financial security and more freedom.',
-      'Relationships' => 'Build warm, present and reliable relationships.',
       'Personal' =>
         'Become disciplined, grounded and proud of my daily choices.',
       'Career' => 'Create my own mobile app and bring it to real users.',
@@ -4957,8 +5744,8 @@ class VerticalFutureTimelineCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final areas = selectedAreas.isEmpty
-        ? const ['Health']
+    final areas = selectedAreas.contains('All') || selectedAreas.isEmpty
+        ? const ['Health', 'Finance', 'Personal', 'Career']
         : selectedAreas.toList();
     final items = [
       for (final goal in goals)
@@ -5274,13 +6061,7 @@ class FutureVisionEditSheet extends StatefulWidget {
 }
 
 class _FutureVisionEditSheetState extends State<FutureVisionEditSheet> {
-  static const _areas = [
-    'Health',
-    'Finance',
-    'Relationships',
-    'Personal',
-    'Career',
-  ];
+  static const _areas = ['Health', 'Finance', 'Personal', 'Career'];
 
   late final Map<String, TextEditingController> _controllers = {
     for (final area in _areas)
@@ -5530,43 +6311,88 @@ class _MotivateScreenState extends State<MotivateScreen> {
   final Set<String> _played = {};
 
   static const _videos = [
-    ('consistency', 'How to\nstay consistent', '3:02', 'MINDSET'),
+    ('video_01', 'By Lucy', '0:00', 'assets/videos/video_01.mp4'),
     (
-      'low_motivation',
+      'video_02',
       'What to do when\nmotivation disappears',
       '4:58',
-      'RESET',
+      'assets/videos/video_02.mp4',
     ),
-    ('discipline', 'Building\ndiscipline', '4:21', 'IDENTITY'),
+    ('video_03', 'Building\ndiscipline', '4:21', 'assets/videos/video_03.mp4'),
   ];
 
-  void _markPlayed(String id) {
-    setState(() => _played.add(id));
+  Future<void> _openVideo(
+    BuildContext context, {
+    required String id,
+    required String title,
+    required String storagePath,
+  }) async {
+    if (storagePath.isEmpty) {
+      setState(() => _played.add(id));
+      return;
+    }
+    if (_isFlutterTest) {
+      setState(() => _played.add(id));
+      return;
+    }
+
+    showCupertinoDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const CupertinoAlertDialog(
+        content: Padding(
+          padding: EdgeInsets.only(top: 8),
+          child: CupertinoActivityIndicator(),
+        ),
+      ),
+    );
+
+    try {
+      final url = await FirebaseStorage.instance
+          .ref(storagePath)
+          .getDownloadURL();
+      if (!context.mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      await Navigator.of(context).push(
+        CupertinoPageRoute<void>(
+          fullscreenDialog: true,
+          builder: (_) => FirebaseLucyVideoPlayer(
+            title: title.replaceAll('\n', ' '),
+            videoUrl: url,
+          ),
+        ),
+      );
+      if (mounted) setState(() => _played.add(id));
+    } catch (_) {
+      if (!context.mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      showCupertinoDialog<void>(
+        context: context,
+        builder: (dialogContext) => CupertinoAlertDialog(
+          title: const Text('Video unavailable'),
+          content: const Text(
+            'Lucy video could not be loaded from Firebase Storage.',
+          ),
+          actions: [
+            CupertinoDialogAction(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    }
   }
+
+  bool get _isFlutterTest =>
+      Platform.environment.containsKey('FLUTTER_TEST') ||
+      Platform.environment.containsKey('DART_TEST') ||
+      WidgetsBinding.instance.runtimeType.toString().contains(
+        'TestWidgetsFlutterBinding',
+      );
 
   @override
   Widget build(BuildContext context) {
-    final appState = LevelUpScope.of(context);
-    final firstName = appState.user.firstName.isEmpty
-        ? 'there'
-        : appState.user.firstName;
-    final focus =
-        appState.todayTasks
-            .cast<DailyTask?>()
-            .firstWhere(
-              (task) => task != null && !task.completed,
-              orElse: () => null,
-            )
-            ?.title ??
-        appState.activeGoals
-            .cast<Goal?>()
-            .firstWhere(
-              (goal) => goal != null && !goal.completed,
-              orElse: () => null,
-            )
-            ?.title ??
-        'your next small step';
-
     return AppScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -5576,15 +6402,13 @@ class _MotivateScreenState extends State<MotivateScreen> {
           const Text('Stay motivated', style: AppText.title),
           const SizedBox(height: 8),
           Text(
-            'A small reminder for today.',
+            'Your daily fuel.',
             style: AppText.body.copyWith(color: AppColors.muted),
           ),
-          const SizedBox(height: 24),
-          DailyQuoteCard(firstName: firstName, focus: focus),
-          const SizedBox(height: 28),
+          const SizedBox(height: 6),
           const ScienceFuelSection(),
-          const SizedBox(height: 28),
-          const Text('FROM LUCY', style: AppText.eyebrow),
+          const SizedBox(height: 26),
+          const Text('BY LUCY', style: AppText.eyebrow),
           const SizedBox(height: 8),
           const Text(
             'Short lessons to keep you moving.',
@@ -5595,9 +6419,126 @@ class _MotivateScreenState extends State<MotivateScreen> {
             MotivationVideoRow(
               title: video.$2,
               duration: video.$3,
-              tag: video.$4,
               played: _played.contains(video.$1),
-              onPlay: () => _markPlayed(video.$1),
+              onPlay: () => _openVideo(
+                context,
+                id: video.$1,
+                title: video.$2,
+                storagePath: video.$4,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class FirebaseLucyVideoPlayer extends StatefulWidget {
+  const FirebaseLucyVideoPlayer({
+    super.key,
+    required this.title,
+    required this.videoUrl,
+  });
+
+  final String title;
+  final String videoUrl;
+
+  @override
+  State<FirebaseLucyVideoPlayer> createState() =>
+      _FirebaseLucyVideoPlayerState();
+}
+
+class _FirebaseLucyVideoPlayerState extends State<FirebaseLucyVideoPlayer> {
+  late final VideoPlayerController _controller =
+      VideoPlayerController.networkUrl(Uri.parse(widget.videoUrl));
+  bool _ready = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    try {
+      await _controller.initialize();
+      await _controller.setLooping(false);
+      await _controller.play();
+      if (mounted) setState(() => _ready = true);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Video could not be played.');
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoPageScaffold(
+      backgroundColor: Colors.black,
+      child: Stack(
+        children: [
+          Center(
+            child: _error != null
+                ? Text(_error!, style: const TextStyle(color: Colors.white))
+                : !_ready
+                ? const CupertinoActivityIndicator(color: Colors.white)
+                : AspectRatio(
+                    aspectRatio: _controller.value.aspectRatio,
+                    child: VideoPlayer(_controller),
+                  ),
+          ),
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 12,
+            left: 12,
+            right: 12,
+            child: Row(
+              children: [
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(44, 44),
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Icon(
+                    CupertinoIcons.xmark_circle_fill,
+                    color: Colors.white,
+                    size: 34,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    widget.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (_ready)
+            Positioned(
+              left: 24,
+              right: 24,
+              bottom: MediaQuery.of(context).padding.bottom + 28,
+              child: VideoProgressIndicator(
+                _controller,
+                allowScrubbing: true,
+                colors: const VideoProgressColors(
+                  playedColor: AppColors.sage,
+                  bufferedColor: Colors.white38,
+                  backgroundColor: Colors.white24,
+                ),
+              ),
             ),
         ],
       ),
@@ -5656,8 +6597,6 @@ class ScienceFuelSection extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('DAILY FUEL', style: AppText.eyebrow),
-        const SizedBox(height: 10),
         LayoutBuilder(
           builder: (context, constraints) {
             final tileWidth = (constraints.maxWidth - 10) / 2;
@@ -5776,13 +6715,11 @@ class MotivationVideoRow extends StatelessWidget {
     super.key,
     required this.title,
     required this.duration,
-    required this.tag,
     required this.played,
     required this.onPlay,
   });
   final String title;
   final String duration;
-  final String tag;
   final bool played;
   final VoidCallback onPlay;
   @override
@@ -5850,7 +6787,11 @@ class MotivationVideoRow extends StatelessWidget {
             ),
             const SizedBox(width: 16),
             Expanded(child: Text(title, style: AppText.section)),
-            Column(children: [CategoryPill(label: played ? 'WATCHED' : tag)]),
+            if (played)
+              const Icon(
+                CupertinoIcons.check_mark_circled,
+                color: AppColors.sage,
+              ),
           ],
         ),
       ),
@@ -5941,9 +6882,14 @@ class AppHeader extends StatelessWidget {
 }
 
 class LucyAvatarButton extends StatelessWidget {
-  const LucyAvatarButton({super.key, required this.onTap});
+  const LucyAvatarButton({
+    super.key,
+    required this.onTap,
+    this.hasUnread = false,
+  });
 
   final VoidCallback onTap;
+  final bool hasUnread;
 
   @override
   Widget build(BuildContext context) {
@@ -5960,19 +6906,20 @@ class LucyAvatarButton extends StatelessWidget {
               fit: BoxFit.cover,
             ),
           ),
-          Positioned(
-            top: -1,
-            right: -1,
-            child: Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(
-                color: const Color(0xFFE7302A),
-                shape: BoxShape.circle,
-                border: Border.all(color: AppColors.background, width: 1.5),
+          if (hasUnread)
+            Positioned(
+              top: -1,
+              right: -1,
+              child: Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE7302A),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: AppColors.background, width: 1.5),
+                ),
               ),
             ),
-          ),
         ],
       ),
     );
@@ -6186,35 +7133,40 @@ class MenuDetailPage extends StatelessWidget {
           user: LevelUpScope.of(context).user,
         ),
         const SizedBox(height: 14),
-        const MenuInfoCard(
+        MenuInfoCard(
           icon: CupertinoIcons.lock_shield,
-          title: 'Private by default',
-          body:
-              'Guest mode keeps everything on this device. Sign in when you want your Level Up data ready for account sync.',
+          title: LevelUpScope.of(context).isSignedIn
+              ? 'Signed in with Google'
+              : 'Guest mode is active',
+          body: LevelUpScope.of(context).isSignedIn
+              ? 'Your LevelUp account is connected. You can continue using the app normally or sign out to return to guest mode.'
+              : 'Guest mode keeps everything on this device. Sign in with Google when you want your LevelUp data ready for account sync.',
         ),
-        const SizedBox(height: 14),
-        GlassActionButton(
-          icon: CupertinoIcons.person_crop_circle_badge_checkmark,
-          label: 'Continue with Google',
-          strong: true,
-          onTap: () => _showSignInDialog(
-            context,
-            LevelUpScope.read(context).signInWithGoogle,
+        if (!LevelUpScope.of(context).isSignedIn) ...[
+          const SizedBox(height: 14),
+          GlassActionButton(
+            icon: CupertinoIcons.person_crop_circle_badge_checkmark,
+            label: 'Continue with Google',
+            strong: true,
+            onTap: () => _showSignInDialog(
+              context,
+              LevelUpScope.read(context).signInWithGoogle,
+            ),
           ),
-        ),
-        const SizedBox(height: 10),
-        GlassActionButton(
-          icon: CupertinoIcons.person,
-          label: 'Continue as guest',
-          onTap: () async {
-            await LevelUpScope.read(context).continueAsGuest();
-            if (context.mounted) {
-              await _showGuestModeDialog(context);
-            }
-          },
-        ),
-        if (LevelUpScope.of(context).isSignedIn) ...[
           const SizedBox(height: 10),
+          GlassActionButton(
+            icon: CupertinoIcons.person,
+            label: 'Continue as guest',
+            onTap: () async {
+              await LevelUpScope.read(context).continueAsGuest();
+              if (context.mounted) {
+                await _showGuestModeDialog(context);
+              }
+            },
+          ),
+        ],
+        if (LevelUpScope.of(context).isSignedIn) ...[
+          const SizedBox(height: 14),
           GlassActionButton(
             icon: CupertinoIcons.square_arrow_right,
             label: 'Sign out to guest mode',
@@ -6229,6 +7181,18 @@ class MenuDetailPage extends StatelessWidget {
           onTap: () => _showEditNameDialog(context),
         ),
         const SizedBox(height: 12),
+        SettingsToggleRow(
+          title: 'Zprávy od Lucy',
+          enabled: LevelUpScope.of(
+            context,
+          ).reminderSettings.lucyMessagesEnabled,
+          onChanged: (enabled) {
+            final appState = LevelUpScope.read(context);
+            appState.updateReminderSettings(
+              appState.reminderSettings.copyWith(lucyMessagesEnabled: enabled),
+            );
+          },
+        ),
         SettingsToggleRow(
           title: 'Morning Lucy message',
           enabled: LevelUpScope.of(context).reminderSettings.morningEnabled,
@@ -6378,12 +7342,25 @@ class AccountPreviewCard extends StatelessWidget {
       child: Row(
         children: [
           ClipOval(
-            child: Image.asset(
-              'assets/images/lucy_portrait.png',
-              width: 52,
-              height: 52,
-              fit: BoxFit.cover,
-            ),
+            child: session.photoUrl.trim().isNotEmpty
+                ? Image.network(
+                    session.photoUrl.trim(),
+                    width: 52,
+                    height: 52,
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, error, stackTrace) => Image.asset(
+                      'assets/images/lucy_portrait.png',
+                      width: 52,
+                      height: 52,
+                      fit: BoxFit.cover,
+                    ),
+                  )
+                : Image.asset(
+                    'assets/images/lucy_portrait.png',
+                    width: 52,
+                    height: 52,
+                    fit: BoxFit.cover,
+                  ),
           ),
           const SizedBox(width: 14),
           Expanded(
@@ -6494,12 +7471,7 @@ class QuoteHomeWidgetPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final progress = (appState.dailyProgress * 100).round();
-    final quote = appState.todayTasks.isEmpty
-        ? 'Choose one clear task and make it real today.'
-        : progress >= 100
-        ? 'Today is proof. Let the win count.'
-        : 'Small promises kept quietly become identity.';
+    final quote = LucyMessageCatalog.quoteOfTheDay(DateTime.now());
 
     return GlassCard(
       padding: const EdgeInsets.fromLTRB(18, 18, 18, 14),
@@ -6522,7 +7494,7 @@ class QuoteHomeWidgetPreview extends StatelessWidget {
           const SizedBox(height: 10),
           Text(quote, style: AppText.identity),
           const SizedBox(height: 8),
-          Text('$progress% of today complete', style: AppText.caption),
+          const Text('Rotates daily', style: AppText.caption),
         ],
       ),
     );
@@ -7029,25 +8001,33 @@ class StatPill extends StatelessWidget {
 }
 
 class WeekStrip extends StatelessWidget {
-  const WeekStrip({super.key, required this.onTap});
+  const WeekStrip({
+    super.key,
+    required this.selectedDate,
+    required this.onOpenMonth,
+    required this.onSelectDate,
+  });
 
-  final VoidCallback onTap;
+  final DateTime selectedDate;
+  final VoidCallback onOpenMonth;
+  final ValueChanged<DateTime> onSelectDate;
 
   @override
   Widget build(BuildContext context) {
     final appState = LevelUpScope.of(context);
     final now = DateTime.now();
-    final days = _weekDays(appState.taskHistory, now);
+    final days = _weekDays(appState.taskHistory, now, selectedDate);
     final doneCount = days.where((day) => day.state == DayState.done).length;
-    return GestureDetector(
-      onTap: onTap,
-      child: GlassCard(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-        borderRadius: 22,
-        opacity: .36,
-        child: Column(
-          children: [
-            Row(
+    return GlassCard(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      borderRadius: 22,
+      opacity: .36,
+      child: Column(
+        children: [
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: onOpenMonth,
+            child: Row(
               children: [
                 const Text('THIS WEEK', style: AppText.eyebrow),
                 const Spacer(),
@@ -7060,39 +8040,59 @@ class WeekStrip extends StatelessWidget {
                 ),
               ],
             ),
-            const SizedBox(height: 18),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                for (final day in days)
-                  Column(
+          ),
+          const SizedBox(height: 18),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              for (final day in days)
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onSelectDate(day.date),
+                  child: Column(
                     children: [
                       WeekDayBubble(day: day),
                       const SizedBox(height: 6),
-                      Text(day.label, style: AppText.caption),
-                      if (day.isToday) ...[
+                      Text(
+                        day.label,
+                        style: AppText.caption.copyWith(
+                          color: day.isSelected
+                              ? AppColors.clay
+                              : AppColors.muted,
+                          fontWeight: day.isSelected
+                              ? FontWeight.w700
+                              : FontWeight.w400,
+                        ),
+                      ),
+                      if (day.isToday || day.isSelected) ...[
                         const SizedBox(height: 3),
                         Container(
-                          width: 5,
+                          width: day.isSelected ? 18 : 5,
                           height: 5,
-                          decoration: const BoxDecoration(
-                            color: AppColors.clay,
-                            shape: BoxShape.circle,
+                          decoration: BoxDecoration(
+                            color: day.isSelected
+                                ? AppColors.sage
+                                : AppColors.clay,
+                            borderRadius: BorderRadius.circular(999),
                           ),
                         ),
                       ] else
                         const SizedBox(height: 8),
                     ],
                   ),
-              ],
-            ),
-          ],
-        ),
+                ),
+            ],
+          ),
+        ],
       ),
     );
   }
 
-  List<WeekDayState> _weekDays(List<DailyTaskHistory> history, DateTime now) {
+  List<WeekDayState> _weekDays(
+    List<DailyTaskHistory> history,
+    DateTime now,
+    DateTime selectedDate,
+  ) {
     final today = DateTime(now.year, now.month, now.day);
     final start = today.subtract(Duration(days: today.weekday - 1));
     final byDate = {
@@ -7107,6 +8107,7 @@ class WeekStrip extends StatelessWidget {
           labels[index],
           start.add(Duration(days: index)),
           today,
+          DateTime(selectedDate.year, selectedDate.month, selectedDate.day),
           byDate[start.add(Duration(days: index))],
         ),
     ];
@@ -7116,14 +8117,18 @@ class WeekStrip extends StatelessWidget {
     String label,
     DateTime date,
     DateTime today,
+    DateTime selectedDate,
     DailyTaskHistory? history,
   ) {
     final isToday = _isSameDay(date, today);
+    final isSelected = _isSameDay(date, selectedDate);
     final state = _dayStateFor(date, today, history);
     return WeekDayState(
       label,
+      date,
       state,
       isToday: isToday,
+      isSelected: isSelected,
       completedCount: history?.completedCount ?? 0,
       plannedCount: history?.plannedCount ?? 0,
     );
@@ -7136,7 +8141,7 @@ class WeekStrip extends StatelessWidget {
   ) {
     if (date.isAfter(today)) return DayState.future;
     if (history == null || history.plannedCount == 0) {
-      return date.isBefore(today) ? DayState.missed : DayState.today;
+      return date.isBefore(today) ? DayState.future : DayState.today;
     }
     if (history.isComplete) return DayState.done;
     if (date.isBefore(today)) {
@@ -7213,26 +8218,6 @@ class LucyCoachMessage extends StatelessWidget {
                                 const Text(
                                   'Lucy, your coach',
                                   style: AppText.chatName,
-                                ),
-                                const SizedBox(width: 7),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 5,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: const Color(
-                                      0xFFE7302A,
-                                    ).withValues(alpha: .1),
-                                    borderRadius: BorderRadius.circular(999),
-                                  ),
-                                  child: Text(
-                                    'LIVE',
-                                    style: AppText.tiny.copyWith(
-                                      color: const Color(0xFFE7302A),
-                                      fontWeight: FontWeight.w900,
-                                    ),
-                                  ),
                                 ),
                               ],
                             ),
@@ -7338,15 +8323,19 @@ enum DayState { done, missed, partial, today, future }
 class WeekDayState {
   const WeekDayState(
     this.label,
+    this.date,
     this.state, {
     this.isToday = false,
+    this.isSelected = false,
     this.completedCount = 0,
     this.plannedCount = 0,
   });
 
   final String label;
+  final DateTime date;
   final DayState state;
   final bool isToday;
+  final bool isSelected;
   final int completedCount;
   final int plannedCount;
 }
@@ -7358,25 +8347,36 @@ class WeekDayBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final border = day.isSelected
+        ? Border.all(color: AppColors.sage, width: 2)
+        : null;
     if (day.state == DayState.done || day.state == DayState.today) {
-      return CircleAvatar(
-        radius: day.state == DayState.today ? 14 : 13,
-        backgroundColor: day.state == DayState.today
-            ? AppColors.clay
-            : AppColors.sage,
-        foregroundColor: Colors.white,
+      return Container(
+        width: 32,
+        height: 32,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: border,
+          color: day.state == DayState.today ? AppColors.clay : AppColors.sage,
+        ),
         child: Icon(
           day.state == DayState.today
               ? CupertinoIcons.circle_fill
               : CupertinoIcons.check_mark,
           size: day.state == DayState.today ? 10 : 17,
+          color: Colors.white,
         ),
       );
     }
     if (day.state == DayState.missed) {
-      return CircleAvatar(
-        radius: 16,
-        backgroundColor: AppColors.clay.withValues(alpha: .12),
+      return Container(
+        width: 32,
+        height: 32,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: border,
+          color: AppColors.clay.withValues(alpha: .12),
+        ),
         child: const Icon(
           CupertinoIcons.xmark,
           size: 15,
@@ -7385,9 +8385,14 @@ class WeekDayBubble extends StatelessWidget {
       );
     }
     if (day.state == DayState.partial) {
-      return CircleAvatar(
-        radius: 16,
-        backgroundColor: AppColors.gold.withValues(alpha: .16),
+      return Container(
+        width: 32,
+        height: 32,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: border,
+          color: AppColors.gold.withValues(alpha: .16),
+        ),
         child: const Icon(
           CupertinoIcons.minus,
           size: 15,
@@ -7396,28 +8401,67 @@ class WeekDayBubble extends StatelessWidget {
       );
     }
     return Container(
-      width: 27,
-      height: 27,
+      width: 32,
+      height: 32,
+      alignment: Alignment.center,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        border: Border.all(color: AppColors.taupe),
+        border: border,
+        color: Colors.white.withValues(alpha: .42),
+      ),
+      child: Container(
+        width: 13,
+        height: 13,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: AppColors.taupe),
+        ),
       ),
     );
   }
 }
 
-class MonthOverviewScreen extends StatelessWidget {
+class MonthOverviewScreen extends StatefulWidget {
   const MonthOverviewScreen({super.key, required this.onBack});
 
   final VoidCallback onBack;
 
   @override
+  State<MonthOverviewScreen> createState() => _MonthOverviewScreenState();
+}
+
+class _MonthOverviewScreenState extends State<MonthOverviewScreen> {
+  late DateTime _visibleMonth = DateTime(
+    DateTime.now().year,
+    DateTime.now().month,
+  );
+  late DateTime _selectedDate = _dateOnly(DateTime.now());
+
+  DateTime get _firstVisibleMonth =>
+      DateTime(DateTime.now().year, DateTime.now().month);
+  DateTime get _lastVisibleMonth => DateTime(2028, 12);
+  bool get _canGoPrevious => _visibleMonth.isAfter(_firstVisibleMonth);
+  bool get _canGoNext => _visibleMonth.isBefore(_lastVisibleMonth);
+
+  @override
   Widget build(BuildContext context) {
     final appState = LevelUpScope.of(context);
     final now = DateTime.now();
-    final days = _monthDays(appState.taskHistory, now);
+    final days = _monthDays(
+      appState.taskHistory,
+      now,
+      _visibleMonth,
+      appState.goals,
+    );
     final doneCount = days.where((day) => day.state == DayState.done).length;
-    final monthName = _monthName(now.month);
+    final monthName = _monthName(_visibleMonth.month);
+    final selectedDay = days.firstWhere(
+      (day) => _isSameDay(day.date, _selectedDate),
+      orElse: () => _monthDayState(_selectedDate, _dateOnly(now), null, 0),
+    );
+    final selectedTasks = _tasksForDay(appState.tasks, _selectedDate, now);
+    final selectedDeadlines = _deadlinesForDay(appState.goals, _selectedDate);
+
     return AppScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -7425,7 +8469,7 @@ class MonthOverviewScreen extends StatelessWidget {
           CupertinoButton(
             padding: EdgeInsets.zero,
             minimumSize: const Size(0, 28),
-            onPressed: onBack,
+            onPressed: widget.onBack,
             child: const Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -7436,10 +8480,10 @@ class MonthOverviewScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 22),
-          Text('$monthName Overview', style: AppText.title),
+          Text('$monthName ${_visibleMonth.year}', style: AppText.title),
           const SizedBox(height: 6),
           const Text(
-            'Your task rhythm across the full month.',
+            'Your task rhythm, history and goal deadlines.',
             style: AppText.body,
           ),
           const SizedBox(height: 22),
@@ -7457,6 +8501,20 @@ class MonthOverviewScreen extends StatelessWidget {
                     ),
                   ],
                 ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    GlassIconButton(
+                      icon: CupertinoIcons.chevron_left,
+                      onTap: _canGoPrevious ? _showPreviousMonth : null,
+                    ),
+                    const Spacer(),
+                    GlassIconButton(
+                      icon: CupertinoIcons.chevron_right,
+                      onTap: _canGoNext ? _showNextMonth : null,
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 18),
                 GridView.builder(
                   shrinkWrap: true,
@@ -7467,59 +8525,101 @@ class MonthOverviewScreen extends StatelessWidget {
                     mainAxisSpacing: 12,
                     crossAxisSpacing: 10,
                   ),
-                  itemBuilder: (context, index) =>
-                      MonthDayCell(day: days[index]),
+                  itemBuilder: (context, index) {
+                    final day = days[index];
+                    return MonthDayCell(
+                      day: day,
+                      selected: _isSameDay(day.date, _selectedDate),
+                      onTap: () => setState(() => _selectedDate = day.date),
+                    );
+                  },
                 ),
               ],
             ),
           ),
           const SizedBox(height: 18),
-          const Row(
+          const Wrap(
+            spacing: 14,
+            runSpacing: 8,
             children: [
               LegendDot(color: AppColors.sage, label: 'Done'),
-              SizedBox(width: 14),
               LegendDot(color: AppColors.clay, label: 'Missed / Today'),
-              SizedBox(width: 14),
               LegendDot(color: AppColors.gold, label: 'Partial'),
-              SizedBox(width: 14),
               LegendDot(color: AppColors.taupe, label: 'Upcoming'),
+              LegendDot(color: AppColors.ink, label: 'Deadline'),
             ],
+          ),
+          const SizedBox(height: 18),
+          CalendarDayDetailCard(
+            date: _selectedDate,
+            day: selectedDay,
+            tasks: selectedTasks,
+            goals: appState.goals,
+            deadlines: selectedDeadlines,
+            today: _dateOnly(now),
           ),
         ],
       ),
     );
   }
 
-  List<MonthDayState> _monthDays(List<DailyTaskHistory> history, DateTime now) {
-    final today = DateTime(now.year, now.month, now.day);
-    final monthStart = DateTime(now.year, now.month);
-    final nextMonth = DateTime(now.year, now.month + 1);
+  List<MonthDayState> _monthDays(
+    List<DailyTaskHistory> history,
+    DateTime now,
+    DateTime visibleMonth,
+    List<Goal> goals,
+  ) {
+    final today = _dateOnly(now);
+    final monthStart = DateTime(visibleMonth.year, visibleMonth.month);
+    final nextMonth = DateTime(visibleMonth.year, visibleMonth.month + 1);
     final dayCount = nextMonth.difference(monthStart).inDays;
-    final byDate = {
-      for (final day in history)
-        DateTime(day.date.year, day.date.month, day.date.day): day,
-    };
+    final byDate = {for (final day in history) _dateOnly(day.date): day};
 
     return [
       for (var day = 1; day <= dayCount; day++)
         _monthDayState(
-          DateTime(now.year, now.month, day),
+          DateTime(visibleMonth.year, visibleMonth.month, day),
           today,
-          byDate[DateTime(now.year, now.month, day)],
+          byDate[DateTime(visibleMonth.year, visibleMonth.month, day)],
+          _deadlinesForDay(
+            goals,
+            DateTime(visibleMonth.year, visibleMonth.month, day),
+          ).length,
         ),
     ];
+  }
+
+  void _showPreviousMonth() {
+    if (!_canGoPrevious) return;
+    _changeVisibleMonth(DateTime(_visibleMonth.year, _visibleMonth.month - 1));
+  }
+
+  void _showNextMonth() {
+    if (!_canGoNext) return;
+    _changeVisibleMonth(DateTime(_visibleMonth.year, _visibleMonth.month + 1));
+  }
+
+  void _changeVisibleMonth(DateTime month) {
+    setState(() {
+      _visibleMonth = DateTime(month.year, month.month);
+      if (!_isSameMonth(_selectedDate, _visibleMonth)) {
+        _selectedDate = _visibleMonth;
+      }
+    });
   }
 
   MonthDayState _monthDayState(
     DateTime date,
     DateTime today,
     DailyTaskHistory? history,
+    int deadlineCount,
   ) {
     return MonthDayState(
-      date.day,
+      _dateOnly(date),
       _dayStateFor(date, today, history),
       completedCount: history?.completedCount ?? 0,
       plannedCount: history?.plannedCount ?? 0,
+      deadlineCount: deadlineCount,
     );
   }
 
@@ -7528,15 +8628,91 @@ class MonthOverviewScreen extends StatelessWidget {
     DateTime today,
     DailyTaskHistory? history,
   ) {
-    if (date.isAfter(today)) return DayState.future;
+    if (_dateOnly(date).isAfter(today)) return DayState.future;
     if (history == null || history.plannedCount == 0) {
-      return date.isBefore(today) ? DayState.missed : DayState.today;
+      return _dateOnly(date).isBefore(today) ? DayState.missed : DayState.today;
     }
     if (history.isComplete) return DayState.done;
-    if (date.isBefore(today)) {
+    if (_dateOnly(date).isBefore(today)) {
       return history.hasAnyProgress ? DayState.partial : DayState.missed;
     }
     return DayState.today;
+  }
+
+  List<DailyTask> _tasksForDay(
+    List<DailyTask> tasks,
+    DateTime selectedDate,
+    DateTime now,
+  ) {
+    final selected = _dateOnly(selectedDate);
+    final today = _dateOnly(now);
+    return tasks.where((task) {
+      final plannedFor = task.plannedFor;
+      if (plannedFor == null) return _isSameDay(selected, today);
+      return _isSameDay(plannedFor, selected);
+    }).toList();
+  }
+
+  List<CalendarDeadline> _deadlinesForDay(List<Goal> goals, DateTime date) {
+    final selected = _dateOnly(date);
+    final deadlines = <CalendarDeadline>[];
+    for (final goal in goals) {
+      final goalDeadline = _parseGoalDeadline(goal.detail);
+      if (goalDeadline != null && _isSameDay(goalDeadline, selected)) {
+        deadlines.add(
+          CalendarDeadline(
+            title: goal.title,
+            category: goal.category,
+            type: 'Goal deadline',
+          ),
+        );
+      }
+      for (final task in goal.milestones) {
+        if (task.dueDate != null && _isSameDay(task.dueDate!, selected)) {
+          deadlines.add(
+            CalendarDeadline(
+              title: task.title,
+              category: goal.category,
+              type: 'Task deadline',
+            ),
+          );
+        }
+      }
+    }
+    return deadlines;
+  }
+
+  DateTime? _parseGoalDeadline(String detail) {
+    final firstPart = detail.split('·').first.trim();
+    if (firstPart.isEmpty) return null;
+    final isoMatch = RegExp(r'\d{4}-\d{2}-\d{2}').firstMatch(firstPart);
+    if (isoMatch != null) {
+      final parsed = DateTime.tryParse(isoMatch.group(0)!);
+      return parsed == null ? null : _dateOnly(parsed);
+    }
+    final friendly = RegExp(
+      r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s*(\d{4})$',
+    ).firstMatch(firstPart);
+    if (friendly == null) return null;
+    const months = {
+      'Jan': 1,
+      'Feb': 2,
+      'Mar': 3,
+      'Apr': 4,
+      'May': 5,
+      'Jun': 6,
+      'Jul': 7,
+      'Aug': 8,
+      'Sep': 9,
+      'Oct': 10,
+      'Nov': 11,
+      'Dec': 12,
+    };
+    return DateTime(
+      int.parse(friendly.group(3)!),
+      months[friendly.group(1)!]!,
+      int.parse(friendly.group(2)!),
+    );
   }
 
   String _monthName(int month) {
@@ -7558,10 +8734,199 @@ class MonthOverviewScreen extends StatelessWidget {
   }
 }
 
+class CalendarDayDetailCard extends StatelessWidget {
+  const CalendarDayDetailCard({
+    super.key,
+    required this.date,
+    required this.day,
+    required this.tasks,
+    required this.goals,
+    required this.deadlines,
+    required this.today,
+  });
+
+  final DateTime date;
+  final MonthDayState day;
+  final List<DailyTask> tasks;
+  final List<Goal> goals;
+  final List<CalendarDeadline> deadlines;
+  final DateTime today;
+
+  @override
+  Widget build(BuildContext context) {
+    final goalById = {for (final goal in goals) goal.id: goal};
+    return GlassCard(
+      padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+      borderRadius: 24,
+      opacity: .50,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(_formatDate(date), style: AppText.cardTitle),
+              ),
+              Text(
+                '${day.completedCount}/${day.plannedCount} tasks',
+                style: AppText.caption.copyWith(color: AppColors.sage),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          const Text('TASK HISTORY', style: AppText.eyebrow),
+          const SizedBox(height: 8),
+          if (tasks.isEmpty)
+            Text(
+              'No tasks planned for this day.',
+              style: AppText.caption.copyWith(color: AppColors.muted),
+            )
+          else
+            for (final task in tasks)
+              _DayTaskRow(
+                task: task,
+                goalTitle: goalById[task.goalId]?.title,
+                isPast: date.isBefore(today),
+              ),
+          const SizedBox(height: 14),
+          const Text('DEADLINES', style: AppText.eyebrow),
+          const SizedBox(height: 8),
+          if (deadlines.isEmpty)
+            Text(
+              'No goal deadlines on this day.',
+              style: AppText.caption.copyWith(color: AppColors.muted),
+            )
+          else
+            for (final deadline in deadlines)
+              _DayDeadlineRow(deadline: deadline),
+        ],
+      ),
+    );
+  }
+
+  static String _formatDate(DateTime date) {
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    return '${months[date.month - 1]} ${date.day}, ${date.year}';
+  }
+}
+
+class _DayTaskRow extends StatelessWidget {
+  const _DayTaskRow({
+    required this.task,
+    required this.goalTitle,
+    required this.isPast,
+  });
+
+  final DailyTask task;
+  final String? goalTitle;
+  final bool isPast;
+
+  @override
+  Widget build(BuildContext context) {
+    final missed = isPast && !task.completed;
+    final icon = task.completed
+        ? CupertinoIcons.check_mark_circled_solid
+        : missed
+        ? CupertinoIcons.xmark_circle_fill
+        : CupertinoIcons.circle;
+    final color = task.completed
+        ? AppColors.sage
+        : missed
+        ? AppColors.clay
+        : AppColors.taupe;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(task.title, style: AppText.bodyStrong),
+                if (goalTitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text('Goal: $goalTitle', style: AppText.caption),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DayDeadlineRow extends StatelessWidget {
+  const _DayDeadlineRow({required this.deadline});
+
+  final CalendarDeadline deadline;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          const Icon(CupertinoIcons.calendar, size: 19, color: AppColors.sage),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(deadline.title, style: AppText.bodyStrong),
+                const SizedBox(height: 2),
+                Text(
+                  '${deadline.type} · ${deadline.category}',
+                  style: AppText.caption,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CalendarDeadline {
+  const CalendarDeadline({
+    required this.title,
+    required this.category,
+    required this.type,
+  });
+
+  final String title;
+  final String category;
+  final String type;
+}
+
 class MonthDayCell extends StatelessWidget {
-  const MonthDayCell({super.key, required this.day});
+  const MonthDayCell({
+    super.key,
+    required this.day,
+    this.selected = false,
+    this.onTap,
+  });
 
   final MonthDayState day;
+  final bool selected;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -7572,25 +8937,48 @@ class MonthDayCell extends StatelessWidget {
       DayState.today => AppColors.clay,
       DayState.future => AppColors.taupe,
     };
-    return Container(
-      decoration: BoxDecoration(
-        color: day.state == DayState.future
-            ? Colors.white.withValues(alpha: .28)
-            : color.withValues(alpha: .16),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: day.state == DayState.today
-              ? AppColors.clay
-              : Colors.white.withValues(alpha: .58),
-        ),
-      ),
-      child: Center(
-        child: Text(
-          '${day.day}',
-          style: AppText.tiny.copyWith(
-            color: day.state == DayState.future ? AppColors.taupe : color,
-            fontWeight: FontWeight.w900,
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        decoration: BoxDecoration(
+          color: day.state == DayState.future
+              ? Colors.white.withValues(alpha: .28)
+              : color.withValues(alpha: .16),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            width: selected ? 1.8 : 1,
+            color: selected
+                ? AppColors.ink
+                : day.state == DayState.today
+                ? AppColors.clay
+                : Colors.white.withValues(alpha: .58),
           ),
+        ),
+        child: Stack(
+          children: [
+            Center(
+              child: Text(
+                '${day.day}',
+                style: AppText.tiny.copyWith(
+                  color: day.state == DayState.future ? AppColors.taupe : color,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ),
+            if (day.deadlineCount > 0)
+              Positioned(
+                right: 5,
+                bottom: 5,
+                child: Container(
+                  width: 5,
+                  height: 5,
+                  decoration: const BoxDecoration(
+                    color: AppColors.ink,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -7599,17 +8987,29 @@ class MonthDayCell extends StatelessWidget {
 
 class MonthDayState {
   const MonthDayState(
-    this.day,
+    this.date,
     this.state, {
     this.completedCount = 0,
     this.plannedCount = 0,
+    this.deadlineCount = 0,
   });
 
-  final int day;
+  final DateTime date;
   final DayState state;
   final int completedCount;
   final int plannedCount;
+  final int deadlineCount;
+
+  int get day => date.day;
 }
+
+DateTime _dateOnly(DateTime date) => DateTime(date.year, date.month, date.day);
+
+bool _isSameMonth(DateTime a, DateTime b) =>
+    a.year == b.year && a.month == b.month;
+
+bool _isSameDay(DateTime a, DateTime b) =>
+    a.year == b.year && a.month == b.month && a.day == b.day;
 
 class LegendDot extends StatelessWidget {
   const LegendDot({super.key, required this.color, required this.label});
@@ -8384,10 +9784,14 @@ class GlassActionButton extends StatelessWidget {
           children: [
             Icon(icon, size: 17, color: strong ? Colors.white : AppColors.clay),
             const SizedBox(width: 7),
-            Text(
-              label,
-              style: AppText.bodyStrong.copyWith(
-                color: strong ? Colors.white : AppColors.ink,
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppText.bodyStrong.copyWith(
+                  color: strong ? Colors.white : AppColors.ink,
+                ),
               ),
             ),
           ],
@@ -9191,8 +10595,16 @@ class ReflectionCard extends StatelessWidget {
                   mainAxisSpacing: 10,
                   crossAxisSpacing: 10,
                 ),
-                itemBuilder: (context, index) =>
-                    MonthDayCell(day: MonthDayState(index + 1, states[index])),
+                itemBuilder: (context, index) => MonthDayCell(
+                  day: MonthDayState(
+                    DateTime(
+                      DateTime.now().year,
+                      DateTime.now().month,
+                      index + 1,
+                    ),
+                    states[index],
+                  ),
+                ),
               ),
             ],
           ),
@@ -9203,38 +10615,36 @@ class ReflectionCard extends StatelessWidget {
 }
 
 class DailyQuoteCard extends StatelessWidget {
-  const DailyQuoteCard({
-    super.key,
-    required this.firstName,
-    required this.focus,
-  });
+  const DailyQuoteCard({super.key, required this.quote});
 
-  final String firstName;
-  final String focus;
+  final String quote;
 
   @override
   Widget build(BuildContext context) {
-    return GlassCard(
+    return Padding(
       padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
-      borderRadius: 22,
-      opacity: .46,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('QUOTE OF THE DAY', style: AppText.eyebrow),
+        /*children: [
+          Text(
+            'Quote of the day',
+            style: AppText.section.copyWith(
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
           const SizedBox(height: 10),
           Text(
-            '$firstName, motivation is allowed to be quiet. Do $focus, then let that proof speak for you.',
+            quote,
             style: AppText.section.copyWith(
               fontSize: 14,
               height: 1.28,
-              fontWeight: FontWeight.w300,
+              fontStyle: FontStyle.italic,
+              fontWeight: FontWeight.w700,
               letterSpacing: 0,
             ),
           ),
-          const SizedBox(height: 8),
-          Text('Lucy', style: AppText.caption.copyWith(fontSize: 11)),
-        ],
+        ],*/
       ),
     );
   }

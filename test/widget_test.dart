@@ -215,7 +215,8 @@ void main() {
       ),
     );
 
-    expect(find.textContaining('Lukas'), findsOneWidget);
+    expect(find.text('Stay motivated'), findsOneWidget);
+    expect(find.text('BY LUCY'), findsOneWidget);
     expect(find.byIcon(CupertinoIcons.bookmark), findsNothing);
     await tester.scrollUntilVisible(
       find.byIcon(CupertinoIcons.play_fill).first,
@@ -223,7 +224,7 @@ void main() {
     );
     await tester.tap(find.byIcon(CupertinoIcons.play_fill).first);
     await tester.pumpAndSettle();
-    expect(find.text('WATCHED'), findsOneWidget);
+    expect(find.byIcon(CupertinoIcons.check_mark_circled), findsOneWidget);
 
     appState.dispose();
   });

@@ -240,24 +240,28 @@ class ReminderSettings {
   const ReminderSettings({
     this.morningEnabled = true,
     this.eveningEnabled = true,
+    this.lucyMessagesEnabled = true,
     this.morningMinutesAfterMidnight = 9 * 60,
     this.eveningMinutesAfterMidnight = 20 * 60 + 30,
   });
 
   final bool morningEnabled;
   final bool eveningEnabled;
+  final bool lucyMessagesEnabled;
   final int morningMinutesAfterMidnight;
   final int eveningMinutesAfterMidnight;
 
   ReminderSettings copyWith({
     bool? morningEnabled,
     bool? eveningEnabled,
+    bool? lucyMessagesEnabled,
     int? morningMinutesAfterMidnight,
     int? eveningMinutesAfterMidnight,
   }) {
     return ReminderSettings(
       morningEnabled: morningEnabled ?? this.morningEnabled,
       eveningEnabled: eveningEnabled ?? this.eveningEnabled,
+      lucyMessagesEnabled: lucyMessagesEnabled ?? this.lucyMessagesEnabled,
       morningMinutesAfterMidnight:
           morningMinutesAfterMidnight ?? this.morningMinutesAfterMidnight,
       eveningMinutesAfterMidnight:
@@ -268,6 +272,7 @@ class ReminderSettings {
   Map<String, dynamic> toJson() => {
     'morningEnabled': morningEnabled,
     'eveningEnabled': eveningEnabled,
+    'lucyMessagesEnabled': lucyMessagesEnabled,
     'morningMinutesAfterMidnight': morningMinutesAfterMidnight,
     'eveningMinutesAfterMidnight': eveningMinutesAfterMidnight,
   };
@@ -276,6 +281,7 @@ class ReminderSettings {
     return ReminderSettings(
       morningEnabled: json['morningEnabled'] ?? true,
       eveningEnabled: json['eveningEnabled'] ?? true,
+      lucyMessagesEnabled: json['lucyMessagesEnabled'] ?? true,
       morningMinutesAfterMidnight:
           json['morningMinutesAfterMidnight'] ?? 9 * 60,
       eveningMinutesAfterMidnight:

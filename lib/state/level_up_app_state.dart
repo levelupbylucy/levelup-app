@@ -56,14 +56,29 @@ class LevelUpAppState extends ChangeNotifier {
 
   List<DailyTask> _tasks = [];
   List<DailyTask> get tasks => List.unmodifiable(_tasks);
-  List<DailyTask> get todayTasks {
-    final now = DateTime.now();
+  List<DailyTask> tasksForDate(DateTime date) {
+    final selectedDate = DateTime(date.year, date.month, date.day);
+    final today = DateTime.now();
+    final todayDate = DateTime(today.year, today.month, today.day);
     return _tasks
         .where(
-          (task) =>
-              task.plannedFor == null || _isSameDay(task.plannedFor!, now),
+          (task) => task.plannedFor == null
+              ? _isSameDay(selectedDate, todayDate)
+              : _isSameDay(task.plannedFor!, selectedDate),
         )
         .toList(growable: false);
+  }
+
+  List<DailyTask> get todayTasks => tasksForDate(DateTime.now());
+
+  int completedTaskCountForDate(DateTime date) =>
+      tasksForDate(date).where((task) => task.completed).length;
+
+  double dailyProgressForDate(DateTime date) {
+    final dayTasks = tasksForDate(date);
+    return dayTasks.isEmpty
+        ? 0
+        : dayTasks.where((task) => task.completed).length / dayTasks.length;
   }
 
   int get completedTaskCount =>
@@ -111,14 +126,18 @@ class LevelUpAppState extends ChangeNotifier {
     _user = await _storage.loadUser();
     _goals = await _storage.loadGoals();
     _tasks = await _storage.loadTasks();
+    await _applyWidgetTaskStates();
     _taskHistory = _mergeTaskHistory(
       await _storage.loadTaskHistory(),
       _buildCurrentTaskHistory(),
     );
     _reminderSettings = await _storage.loadReminderSettings();
     await _storage.saveTaskHistory(_taskHistory);
-    await _notificationService.scheduleDailyReminders(_reminderSettings);
+    await _notificationService.markAppOpenedAndScheduleInactivity(
+      _reminderSettings,
+    );
     await _refreshStreakFromHistory();
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
 
     _isLoading = false;
@@ -144,6 +163,7 @@ class LevelUpAppState extends ChangeNotifier {
     _tasks = _createStarterTasks(firstGoal);
 
     await _persistAll();
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -185,6 +205,7 @@ class LevelUpAppState extends ChangeNotifier {
     await _storage.saveTasks(_tasks);
     await _recordTaskHistorySnapshot();
     await _refreshStreakFromHistory();
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -232,6 +253,7 @@ class LevelUpAppState extends ChangeNotifier {
     await _storage.saveGoals(_goals);
     await _storage.saveTasks(_tasks);
     await _refreshStreakFromHistory();
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -251,6 +273,7 @@ class LevelUpAppState extends ChangeNotifier {
       );
     }).toList();
     await _storage.saveGoals(_goals);
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -266,6 +289,7 @@ class LevelUpAppState extends ChangeNotifier {
       );
     }).toList();
     await _storage.saveGoals(_goals);
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -296,6 +320,10 @@ class LevelUpAppState extends ChangeNotifier {
     await _storage.saveTasks(_tasks);
     await _recordTaskHistorySnapshot();
     await _refreshStreakFromHistory();
+    if (todayTasks.isNotEmpty && completedTaskCount >= todayTasks.length) {
+      await _notificationService.showAllGoalsCompletedNotification();
+    }
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -327,6 +355,7 @@ class LevelUpAppState extends ChangeNotifier {
     }).toList();
 
     await _storage.saveGoals(_goals);
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
   }
@@ -399,7 +428,7 @@ class LevelUpAppState extends ChangeNotifier {
   Future<void> updateReminderSettings(ReminderSettings settings) async {
     _reminderSettings = settings;
     await _storage.saveReminderSettings(_reminderSettings);
-    await _notificationService.scheduleDailyReminders(_reminderSettings);
+    await _evaluateLucyNotifications();
     notifyListeners();
   }
 
@@ -416,8 +445,52 @@ class LevelUpAppState extends ChangeNotifier {
     _seedDemoData();
     _taskHistory = _buildCurrentTaskHistory();
     await _persistAll();
+    await _evaluateLucyNotifications();
     await _syncWidgetData();
     notifyListeners();
+  }
+
+  Future<void> _applyWidgetTaskStates() async {
+    final taskStates = await _widgetDataService.readTaskStates();
+    if (taskStates.isEmpty) return;
+
+    var changed = false;
+    final affectedGoals = <String>{};
+    _tasks = _tasks.map((task) {
+      final completed = taskStates[task.id];
+      if (completed == null || completed == task.completed) return task;
+      changed = true;
+      if (task.goalId != null) affectedGoals.add(task.goalId!);
+      return task.copyWith(
+        completed: completed,
+        completedAt: completed ? DateTime.now() : null,
+        clearCompletedAt: !completed,
+      );
+    }).toList();
+
+    if (!changed) return;
+
+    for (final goalId in affectedGoals) {
+      final goalTasks = _tasks.where((task) => task.goalId == goalId).toList();
+      if (goalTasks.isEmpty) continue;
+      final progress =
+          goalTasks.where((task) => task.completed).length / goalTasks.length;
+      _goals = _goals.map((goal) {
+        if (goal.id != goalId) return goal;
+        return goal.copyWith(
+          progress: progress,
+          completed: progress >= 1,
+          completedAt: progress >= 1 ? DateTime.now() : null,
+          clearCompletedAt: progress < 1,
+        );
+      }).toList();
+    }
+
+    await _storage.saveTasks(_tasks);
+    await _storage.saveGoals(_goals);
+    await _recordTaskHistorySnapshot();
+    await _refreshStreakFromHistory();
+    await _evaluateLucyNotifications();
   }
 
   Future<void> _persistAll() async {
@@ -495,6 +568,18 @@ class LevelUpAppState extends ChangeNotifier {
           : currentGoal!.detail.trim(),
       quoteOfTheDay: LucyMessageCatalog.quoteOfTheDay(DateTime.now()),
       todayTasks: todayTasks,
+    );
+  }
+
+  Future<void> _evaluateLucyNotifications() async {
+    await _notificationService.evaluateLucyNotificationRules(
+      LucyNotificationSnapshot(
+        settings: _reminderSettings,
+        todayTaskCount: todayTasks.length,
+        todayCompletedTaskCount: completedTaskCount,
+        currentStreak: _user.streakDays,
+        now: DateTime.now(),
+      ),
     );
   }
 
@@ -828,9 +913,10 @@ class LevelUpAppState extends ChangeNotifier {
 
   int _calculateCurrentStreak(DateTime now) {
     final byDay = {
-      for (final day in taskHistory)
+      for (final day in taskHistory.where((day) => day.plannedCount > 0))
         DateTime(day.date.year, day.date.month, day.date.day): day,
     };
+    if (byDay.isEmpty) return 0;
 
     final today = DateTime(now.year, now.month, now.day);
     final todayHistory = byDay[today];
@@ -839,9 +925,16 @@ class LevelUpAppState extends ChangeNotifier {
         : today.subtract(const Duration(days: 1));
 
     var streak = 0;
-    while (true) {
+    final earliest = byDay.keys.reduce(
+      (left, right) => left.isBefore(right) ? left : right,
+    );
+    while (!cursor.isBefore(earliest)) {
       final history = byDay[cursor];
-      if (history == null || !history.isComplete) break;
+      if (history == null || history.plannedCount == 0) {
+        cursor = cursor.subtract(const Duration(days: 1));
+        continue;
+      }
+      if (!history.isComplete) break;
       streak += 1;
       cursor = cursor.subtract(const Duration(days: 1));
     }
